@@ -33,3 +33,34 @@ workflows:
     artifacts:
       - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
+
+  # Compila SIN firmar (no necesita cuenta de Apple): sirve para detectar errores
+  # de codigo. Genera Carraca-sin-firmar.ipa (no instalable tal cual en un iPhone).
+  ios-check:
+    name: Comprobar compilacion (sin firmar)
+    max_build_duration: 45
+    instance_type: mac_mini_m2
+    environment:
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Generar proyecto Xcode
+        script: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Instalar pods (VLC)
+        script: pod install --repo-update
+      - name: Compilar sin firma
+        script: |
+          set -o pipefail
+          xcodebuild -workspace Carraca.xcworkspace -scheme Carraca -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build \
+            | xcpretty || (echo "---- ERRORES ----"; grep -E "error:" build/xcodebuild.log 2>/dev/null; exit 1)
+      - name: Empaquetar IPA sin firmar
+        script: |
+          mkdir -p build/out/Payload
+          cp -R build/dd/Build/Products/Release-iphoneos/Carraca.app build/out/Payload/
+          cd build/out && zip -qry Carraca-sin-firmar.ipa Payload
+    artifacts:
+      - build/out/*.ipa
