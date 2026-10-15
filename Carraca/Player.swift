@@ -1,0 +1,354 @@
+import SwiftUI
+import MobileVLCKit
+
+struct Track: Identifiable, Hashable {
+    let id: Int32
+    let name: String
+}
+
+/// Envoltorio del motor VLC (reproduce TS, MKV, AVI…).
+final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
+    let player = VLCMediaPlayer()
+
+    @Published var playing = false
+    @Published var buffering = true
+    @Published var timeMs = 0
+    @Published var lengthMs = 0
+    @Published var failed = false
+    @Published var ended = false
+
+    private var url: URL?
+    private var live = false
+    private var retries = 0
+
+    override init() {
+        super.init()
+        player.delegate = self
+    }
+
+    func start(url: URL, startMs: Int, live: Bool) {
+        self.url = url
+        self.live = live
+        failed = false
+        buffering = true
+        let media = VLCMedia(url: url)
+        media.addOption(":network-caching=\(live ? 2500 : 4000)")
+        if startMs > 0 { media.addOption(":start-time=\(Double(startMs) / 1000.0)") }
+        player.media = media
+        player.play()
+    }
+
+    func restart() {
+        retries = 0
+        guard let url else { return }
+        start(url: url, startMs: live ? 0 : timeMs, live: live)
+    }
+
+    func toggle() {
+        if player.isPlaying { player.pause() } else { player.play() }
+    }
+
+    func seek(toFraction f: Double) {
+        player.position = Float(max(0, min(1, f)))
+    }
+
+    func jump(_ seconds: Int32) {
+        if seconds >= 0 { player.jumpForward(seconds) } else { player.jumpBackward(-seconds) }
+    }
+
+    func stop() {
+        player.delegate = nil
+        player.stop()
+    }
+
+    // MARK: Pistas de audio y subtítulos
+
+    var audioTracks: [Track] { tracks(player.audioTrackIndexes, player.audioTrackNames) }
+    var subtitleTracks: [Track] { tracks(player.videoSubTitlesIndexes, player.videoSubTitlesNames) }
+    var currentAudio: Int32 { player.currentAudioTrackIndex }
+    var currentSubtitle: Int32 { player.currentVideoSubTitleIndex }
+
+    func setAudio(_ id: Int32) {
+        player.currentAudioTrackIndex = id
+        objectWillChange.send()
+    }
+
+    func setSubtitle(_ id: Int32) {
+        player.currentVideoSubTitleIndex = id
+        objectWillChange.send()
+    }
+
+    private func tracks(_ indexes: [Any]?, _ names: [Any]?) -> [Track] {
+        let ids = (indexes ?? []).compactMap { ($0 as? NSNumber)?.int32Value }
+        let titles = (names ?? []).map { "\($0)" }
+        return zip(ids, titles).map { Track(id: $0, name: $1) }
+    }
+
+    // MARK: VLCMediaPlayerDelegate
+
+    func mediaPlayerStateChanged(_ aNotification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            switch self.player.state {
+            case .opening:
+                self.buffering = true
+            case .buffering:
+                if !self.player.isPlaying { self.buffering = true }
+            case .playing:
+                self.buffering = false
+                self.playing = true
+                self.retries = 0
+            case .paused:
+                self.playing = false
+            case .error:
+                self.handleError()
+            case .ended:
+                if self.live { self.handleError() } else { self.ended = true }
+            case .stopped:
+                self.playing = false
+            default:
+                break
+            }
+        }
+    }
+
+    func mediaPlayerTimeChanged(_ aNotification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.timeMs = Int(self.player.time.intValue)
+            if let len = self.player.media?.length.intValue, len > 0 { self.lengthMs = Int(len) }
+            if self.buffering { self.buffering = false }
+            if !self.playing && self.player.isPlaying { self.playing = true }
+        }
+    }
+
+    /// Como mucho 3 reintentos y con pausa creciente: el proveedor banea las ráfagas.
+    private func handleError() {
+        guard retries < 3, let url else {
+            failed = true
+            buffering = false
+            playing = false
+            return
+        }
+        retries += 1
+        buffering = true
+        let resumeAt = live ? 0 : timeMs
+        let isLive = live
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(3 * retries)) { [weak self] in
+            self?.start(url: url, startMs: resumeAt, live: isLive)
+        }
+    }
+}
+
+struct VLCVideoView: UIViewRepresentable {
+    let controller: VLCController
+
+    func makeUIView(context: Context) -> UIView {
+        let v = UIView()
+        v.backgroundColor = .black
+        controller.player.drawable = v
+        return v
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+struct PlayerView: View {
+    let item: PlayItem
+    @EnvironmentObject private var session: Session
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var vlc = VLCController()
+    @State private var showControls = true
+    @State private var hideWork: DispatchWorkItem?
+    @State private var scrub: Double?
+    @State private var epg: [EPGEntry] = []
+    private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VLCVideoView(controller: vlc).ignoresSafeArea()
+            if vlc.buffering && !vlc.failed {
+                ProgressView().controlSize(.large).tint(.white)
+            }
+            if vlc.failed {
+                failure
+            } else if showControls {
+                controls.transition(.opacity)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
+            if showControls { scheduleHide() }
+        }
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
+        .onAppear {
+            UIApplication.shared.isIdleTimerDisabled = true
+            vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
+            scheduleHide()
+        }
+        .onDisappear {
+            report()
+            vlc.stop()
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+        .onReceive(tick) { _ in report() }
+        .onChange(of: vlc.ended) { done in
+            if done {
+                report(final: true)
+                dismiss()
+            }
+        }
+        .task { await loadEPG() }
+    }
+
+    // MARK: Controles
+
+    private var controls: some View {
+        ZStack {
+            LinearGradient(colors: [.black.opacity(0.75), .clear, .clear, .black.opacity(0.85)],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+
+            VStack {
+                HStack(alignment: .top, spacing: 14) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.title3.weight(.semibold))
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.title).font(.headline).lineLimit(1)
+                        if let s = item.subtitle { Text(s).font(.subheadline).opacity(0.8).lineLimit(1) }
+                        if let now = epg.first { Text("Ahora: \(now.title)").font(.subheadline).lineLimit(1) }
+                        if epg.count > 1 { Text("Después: \(epg[1].title)").font(.caption).opacity(0.75).lineLimit(1) }
+                    }
+                    Spacer()
+                    if !vlc.audioTracks.isEmpty || !vlc.subtitleTracks.isEmpty { tracksMenu }
+                }
+                .padding()
+
+                Spacer()
+
+                HStack(spacing: 52) {
+                    if !item.isLive {
+                        Button { vlc.jump(-10); scheduleHide() } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+                    }
+                    Button { vlc.toggle(); scheduleHide() } label: {
+                        Image(systemName: vlc.playing ? "pause.fill" : "play.fill").font(.system(size: 46))
+                    }
+                    if !item.isLive {
+                        Button { vlc.jump(30); scheduleHide() } label: { Image(systemName: "goforward.30").font(.system(size: 34)) }
+                    }
+                }
+
+                Spacer()
+
+                if item.isLive {
+                    HStack {
+                        Text("● EN DIRECTO")
+                            .font(.caption.bold())
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(Color.red.opacity(0.85), in: Capsule())
+                        Spacer()
+                    }
+                    .padding()
+                } else if vlc.lengthMs > 0 {
+                    seekBar.padding(.horizontal).padding(.bottom, 14)
+                }
+            }
+            .foregroundStyle(.white)
+        }
+    }
+
+    private var seekBar: some View {
+        VStack(spacing: 4) {
+            Slider(value: Binding(get: { scrub ?? fraction }, set: { scrub = $0 }), in: 0...1, onEditingChanged: { editing in
+                hideWork?.cancel()
+                if !editing, let f = scrub {
+                    vlc.seek(toFraction: f)
+                    scrub = nil
+                    scheduleHide()
+                }
+            })
+            HStack {
+                Text(timeText(scrub.map { Int($0 * Double(vlc.lengthMs)) } ?? vlc.timeMs))
+                Spacer()
+                Text(timeText(vlc.lengthMs))
+            }
+            .font(.caption.monospacedDigit())
+        }
+    }
+
+    private var fraction: Double {
+        vlc.lengthMs > 0 ? Double(vlc.timeMs) / Double(vlc.lengthMs) : 0
+    }
+
+    private var tracksMenu: some View {
+        Menu {
+            if !vlc.audioTracks.isEmpty {
+                Section("Audio") {
+                    ForEach(vlc.audioTracks) { t in
+                        Button { vlc.setAudio(t.id) } label: {
+                            if t.id == vlc.currentAudio { Label(t.name, systemImage: "checkmark") } else { Text(t.name) }
+                        }
+                    }
+                }
+            }
+            if !vlc.subtitleTracks.isEmpty {
+                Section("Subtítulos") {
+                    ForEach(vlc.subtitleTracks) { t in
+                        Button { vlc.setSubtitle(t.id) } label: {
+                            if t.id == vlc.currentSubtitle { Label(t.name, systemImage: "checkmark") } else { Text(t.name) }
+                        }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "captions.bubble")
+                .font(.title3)
+                .padding(12)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+    }
+
+    private var failure: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "exclamationmark.triangle").font(.largeTitle)
+            Text("No se ha podido reproducir").font(.headline)
+            Text("Puede que no esté disponible ahora mismo. Prueba en unos minutos.")
+                .font(.subheadline).multilineTextAlignment(.center).opacity(0.8)
+            HStack(spacing: 16) {
+                Button("Reintentar") { vlc.restart() }.buttonStyle(.borderedProminent)
+                Button("Cerrar") { dismiss() }.buttonStyle(.bordered)
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(30)
+    }
+
+    // MARK: Lógica
+
+    private func scheduleHide() {
+        hideWork?.cancel()
+        let work = DispatchWorkItem { withAnimation(.easeInOut(duration: 0.3)) { showControls = false } }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
+
+    private func report(final: Bool = false) {
+        guard !item.isLive else { return }
+        let len = vlc.lengthMs
+        session.report(item, timeMs: final ? len : vlc.timeMs, lengthMs: len)
+    }
+
+    @MainActor
+    private func loadEPG() async {
+        guard item.isLive, let id = item.liveStreamId, let api = session.api else { return }
+        epg = (try? await api.shortEPG(id)) ?? []
+    }
+}

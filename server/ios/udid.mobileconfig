@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <dict>
+        <key>URL</key>
+        <string>https://carracaservice.duckdns.org/ios/udid.php</string>
+        <key>DeviceAttributes</key>
+        <array>
+            <string>UDID</string>
+            <string>PRODUCT</string>
+            <string>VERSION</string>
+            <string>DEVICE_NAME</string>
+        </array>
+    </dict>
+    <key>PayloadOrganization</key>
+    <string>Carraca</string>
+    <key>PayloadDisplayName</key>
+    <string>Carraca - Registro del dispositivo</string>
+    <key>PayloadDescription</key>
+    <string>Envia el identificador de este dispositivo para poder instalar la app Carraca. No instala nada ni cambia ningun ajuste.</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadUUID</key>
+    <string>49CB1521-F03D-4080-8474-6D0A28623F5B</string>
+    <key>PayloadIdentifier</key>
+    <string>com.carraca.udid</string>
+    <key>PayloadType</key>
+    <string>Profile Service</string>
+</dict>
+</plist>

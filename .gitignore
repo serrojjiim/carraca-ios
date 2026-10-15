@@ -1,0 +1,8 @@
+*.xcodeproj/
+*.xcworkspace/
+Pods/
+Podfile.lock
+build/
+DerivedData/
+.DS_Store
+Carraca/Info.plist
