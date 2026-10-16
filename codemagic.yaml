@@ -64,3 +64,34 @@ workflows:
           cd build/out && zip -qry Carraca-sin-firmar.ipa Payload
     artifacts:
       - build/out/*.ipa
+
+  # Compilacion para SIMULADOR (sin firma): se sube a appetize.io para probar
+  # la app desde el navegador en Windows. Artefacto: Carraca-simulador.zip
+  ios-simulator:
+    name: Simulador (para Appetize)
+    max_build_duration: 45
+    instance_type: mac_mini_m2
+    environment:
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Generar proyecto Xcode
+        script: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Instalar pods (VLC)
+        script: pod install --repo-update
+      - name: Compilar para simulador
+        script: |
+          set -o pipefail
+          xcodebuild -workspace Carraca.xcworkspace -scheme Carraca -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/dd ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO build | xcpretty
+      - name: Empaquetar
+        script: |
+          mkdir -p build/out
+          cd build/dd/Build/Products/Debug-iphonesimulator
+          zip -qry ../../../../out/Carraca-simulador.zip Carraca.app
+    artifacts:
+      - build/out/*.zip
