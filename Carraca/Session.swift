@@ -101,7 +101,30 @@ final class Session: ObservableObject {
     private func apply(_ c: Credentials) {
         creds = c
         api = c.m3u == nil ? XtreamAPI(base: c.server, user: c.user, pass: c.pass) : nil
+        favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
     }
+
+    // MARK: Favoritos (por cuenta, guardados en el dispositivo)
+
+    @Published private(set) var favorites: Set<String> = []
+
+    private var favoritesKey: String {
+        guard let c = creds else { return "carraca.fav" }
+        return "carraca.fav." + (c.m3u ?? (c.user + "@" + c.server))
+    }
+
+    static func favoriteID(_ s: LiveStream) -> String { s.directURL?.absoluteString ?? "x\(s.id)" }
+
+    func isFavorite(_ s: LiveStream) -> Bool { favorites.contains(Session.favoriteID(s)) }
+
+    func toggleFavorite(_ s: LiveStream) {
+        let id = Session.favoriteID(s)
+        if favorites.contains(id) { favorites.remove(id) } else { favorites.insert(id) }
+        UserDefaults.standard.set(Array(favorites), forKey: favoritesKey)
+    }
+
+    /// Último servidor usado (para rellenar el login si se cierra sesión).
+    static let lastServerKey = "carraca.lastServer"
 
     // MARK: Enlace de acceso
 
@@ -153,6 +176,7 @@ final class Session: ObservableObject {
             do {
                 let info = try await api.authenticate()
                 let c = Credentials(server: base, user: u, pass: pass, usesDefaultServer: custom.isEmpty)
+                if !custom.isEmpty { UserDefaults.standard.set(custom, forKey: Session.lastServerKey) }
                 Keychain.save(c)
                 apply(c)
                 account = info

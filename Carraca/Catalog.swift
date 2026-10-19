@@ -37,6 +37,12 @@ struct LiveView: View {
     private var list: some View {
         List {
             if query.isEmpty {
+                let favs = channels(in: Category.favorites)
+                if !favs.isEmpty {
+                    NavigationLink(value: Category.favorites) {
+                        CategoryRow(name: "⭐ Favoritos", count: favs.count)
+                    }
+                }
                 NavigationLink(value: Category.all) { CategoryRow(name: "Todos los canales", count: streams.count) }
                 ForEach(categories) { c in
                     NavigationLink(value: c) { CategoryRow(name: c.name, count: counts[c.id] ?? 0) }
@@ -45,6 +51,7 @@ struct LiveView: View {
                 let results = searchResults
                 ForEach(results) { s in
                     Button { play(s, in: results) } label: { ChannelRow(stream: s) }
+                        .favoriteActions(s)
                 }
             }
         }
@@ -58,7 +65,11 @@ struct LiveView: View {
     }
 
     private func channels(in cat: Category) -> [LiveStream] {
-        cat.id == Category.all.id ? streams : streams.filter { $0.categoryId == cat.id }
+        switch cat.id {
+        case Category.all.id: return streams
+        case Category.favorites.id: return streams.filter { session.isFavorite($0) }
+        default: return streams.filter { $0.categoryId == cat.id }
+        }
     }
 
     @MainActor
@@ -116,6 +127,7 @@ struct ChannelListView: View {
         let list = filtered
         List(list) { s in
             Button { onPlay(s, list) } label: { ChannelRow(stream: s) }
+                .favoriteActions(s)
         }
         .listStyle(.plain)
         .navigationTitle(title)
@@ -127,8 +139,39 @@ struct ChannelListView: View {
     }
 }
 
+extension Category {
+    static let favorites = Category(id: "__favoritos__", name: "Favoritos")
+}
+
+/// Deslizar a la izquierda o mantener pulsado: añadir/quitar de favoritos.
+private struct FavoriteActions: ViewModifier {
+    @EnvironmentObject private var session: Session
+    let stream: LiveStream
+
+    func body(content: Content) -> some View {
+        let fav = session.isFavorite(stream)
+        content
+            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                Button { session.toggleFavorite(stream) } label: {
+                    Label(fav ? "Quitar" : "Favorito", systemImage: fav ? "star.slash" : "star.fill")
+                }
+                .tint(.yellow)
+            }
+            .contextMenu {
+                Button { session.toggleFavorite(stream) } label: {
+                    Label(fav ? "Quitar de favoritos" : "Añadir a favoritos", systemImage: fav ? "star.slash" : "star")
+                }
+            }
+    }
+}
+
+extension View {
+    func favoriteActions(_ s: LiveStream) -> some View { modifier(FavoriteActions(stream: s)) }
+}
+
 struct ChannelRow: View {
     let stream: LiveStream
+    @EnvironmentObject private var session: Session
 
     var body: some View {
         HStack(spacing: 12) {
@@ -137,6 +180,9 @@ struct ChannelRow: View {
                 .background(Color.white.opacity(0.04))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             Text(stream.name).lineLimit(1).foregroundStyle(.primary)
+            if session.isFavorite(stream) {
+                Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
+            }
             Spacer()
             Image(systemName: "play.circle").foregroundStyle(Color.accentColor)
         }

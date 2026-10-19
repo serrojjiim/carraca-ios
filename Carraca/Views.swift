@@ -73,7 +73,7 @@ struct LoginView: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     if mode == .xtream {
-                        field(Flavor.isPrivate ? "Servidor (opcional)" : "Servidor (http://…)",
+                        field(Flavor.isPrivate ? "Servidor (opcional)" : "Servidor, ej. http://servidor.com:8080",
                               text: $server, icon: "server.rack", keyboard: .URL)
                         if Flavor.isPrivate {
                             Text("Déjalo vacío para usar el servidor Carraca.")
@@ -132,8 +132,12 @@ struct LoginView: View {
     }
 
     /// Rellena el formulario con los datos del enlace carraca://login
+    /// (o, si no hay enlace, con el último servidor usado).
     private func applyPrefill() {
-        guard let p = session.prefill else { return }
+        guard let p = session.prefill else {
+            if server.isEmpty { server = UserDefaults.standard.string(forKey: Session.lastServerKey) ?? "" }
+            return
+        }
         if !p.m3u.isEmpty {
             mode = .m3u
             m3u = p.m3u

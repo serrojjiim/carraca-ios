@@ -188,6 +188,12 @@ struct PlayerView: View {
                     withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
                     if showControls { scheduleHide() }
                 }
+                // Directo: deslizar a izquierda/derecha cambia de canal.
+                .gesture(DragGesture(minimumDistance: 40).onEnded { v in
+                    let dx = v.translation.width, dy = v.translation.height
+                    guard canZap, abs(dx) > 80, abs(dx) > abs(dy) * 1.5 else { return }
+                    zap(dx < 0 ? 1 : -1)
+                })
             if vlc.buffering && !vlc.failed {
                 ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false)
             }
@@ -201,6 +207,7 @@ struct PlayerView: View {
         .persistentSystemOverlays(.hidden)
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            setOrientation(.landscape)
             if item.isLive, !item.channels.isEmpty { channelIndex = item.channelIndex }
             vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
             scheduleHide()
@@ -209,6 +216,7 @@ struct PlayerView: View {
             report()
             vlc.stop()
             UIApplication.shared.isIdleTimerDisabled = false
+            setOrientation(.portrait)
         }
         .onReceive(tick) { _ in report() }
         .onChange(of: vlc.ended) { done in
@@ -364,6 +372,14 @@ struct PlayerView: View {
         guard !item.isLive else { return }
         let len = vlc.lengthMs
         session.report(item, timeMs: final ? len : vlc.timeMs, lengthMs: len)
+    }
+
+    /// iPhone: el vídeo se abre en horizontal y al salir se vuelve a vertical (en iPad no se fuerza).
+    private func setOrientation(_ mask: UIInterfaceOrientationMask) {
+        guard UIDevice.current.userInterfaceIdiom == .phone,
+              let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
+        else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
     }
 
     /// Canal anterior (-1) o siguiente (+1) de la lista desde la que se abrió.
