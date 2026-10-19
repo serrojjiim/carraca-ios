@@ -34,6 +34,7 @@ textarea{width:100%;box-sizing:border-box;height:90px;padding:10px;border-radius
 <div id="admin" class="hide">
   <h1>Crear enlace de acceso</h1><p class="sub">Rellena los datos de tu amigo y mándale el enlace por WhatsApp.</p>
   <div class="card">
+    <label class="note">Servidor (se rellena solo con el tuyo)</label>
     <input id="s" placeholder="Servidor (http://...)" autocapitalize="off" autocorrect="off">
     <input id="u" placeholder="Usuario" autocapitalize="off" autocorrect="off">
     <input id="p" placeholder="Contraseña" autocapitalize="off" autocorrect="off">
@@ -61,6 +62,14 @@ if (q.get("s") || q.get("m3u")) {
   document.getElementById("open").href = "carraca://login?" + a.toString();
 } else {
   document.getElementById("admin").classList.remove("hide");
+  // Servidor = primera URL de config.json (base_url): solo hay que poner usuario y contraseña.
+  fetch("/config.json", { cache: "no-store" })
+    .then(function (r) { return r.json(); })
+    .then(function (c) {
+      var s = document.getElementById("s");
+      if (c && c.base_url && !s.value) { s.value = c.base_url; }
+    })
+    .catch(function () {});
 }
 function gen() {
   var a = new URLSearchParams();
