@@ -56,14 +56,12 @@ workflows:
       - name: Numero de build
         script: |
           sed -i '' "s/CURRENT_PROJECT_VERSION: \"1\"/CURRENT_PROJECT_VERSION: \"$BUILD_NUMBER\"/" project.yml
+      - name: Firma (crea certificado y perfil si no existen)
+        script: bash scripts/firma.sh appstore
       - *xcodegen
       - *pods
-      - name: Firma (crea App ID, certificado y perfil si no existen)
-        script: |
-          keychain initialize
-          app-store-connect fetch-signing-files "com.carraca.smarter" --type IOS_APP_STORE --create
-          keychain add-certificates
-          xcode-project use-profiles
+      - name: Opciones de exportacion
+        script: xcode-project use-profiles || true
       - name: Compilar IPA
         script: xcode-project build-ipa --workspace Carraca.xcworkspace --scheme Carraca
     artifacts:
@@ -144,14 +142,12 @@ workflows:
           sed -i '' "s/CURRENT_PROJECT_VERSION: \"1\"/CURRENT_PROJECT_VERSION: \"$BUILD_NUMBER\"/" project.yml
           sed -i '' 's/^        # FLAVOR.*$/        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) CARRACA_PRIVATE"/' project.yml
           grep -n "CARRACA_PRIVATE\|CURRENT_PROJECT_VERSION" project.yml
+      - name: Firma Ad Hoc (incluye los dispositivos registrados en Apple)
+        script: bash scripts/firma.sh adhoc
       - *xcodegen
       - *pods
-      - name: Firma Ad Hoc (incluye los dispositivos registrados en Apple)
-        script: |
-          keychain initialize
-          app-store-connect fetch-signing-files "com.carraca.smarter" --type IOS_APP_ADHOC --create
-          keychain add-certificates
-          xcode-project use-profiles
+      - name: Opciones de exportacion
+        script: xcode-project use-profiles || true
       - name: Compilar IPA
         script: xcode-project build-ipa --workspace Carraca.xcworkspace --scheme Carraca
     artifacts:

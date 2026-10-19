@@ -24,6 +24,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: NO
+        # SIGNING (lo rellena scripts/firma.sh en Codemagic)
         # FLAVOR (el flujo Ad Hoc sustituye esta linea por la version privada)
     info:
       path: Carraca/Info.plist
