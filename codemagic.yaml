@@ -5,7 +5,7 @@
 #   ios-adhoc      : version PRIVADA (servidor Carraca, Deportes...) firmada Ad Hoc
 #
 # Requisitos en Codemagic para firmar:
-#   - Integracion App Store Connect llamada "Carraca ASC" (clave API de la cuenta de Apple).
+#   - Integracion App Store Connect llamada "sergio" (clave API de la cuenta de Apple).
 #   - Grupo de variables "carraca_firma" con CERTIFICATE_PRIVATE_KEY (clave RSA del certificado).
 
 definitions:
@@ -27,7 +27,7 @@ workflows:
     max_build_duration: 15
     instance_type: mac_mini_m2
     integrations:
-      app_store_connect: Carraca ASC
+      app_store_connect: sergio
     scripts:
       - name: Identificadores existentes
         script: app-store-connect bundle-ids list --platform IOS || true
@@ -46,7 +46,7 @@ workflows:
     max_build_duration: 60
     instance_type: mac_mini_m2
     integrations:
-      app_store_connect: Carraca ASC
+      app_store_connect: sergio
     environment:
       groups:
         - carraca_firma
@@ -130,7 +130,7 @@ workflows:
     max_build_duration: 60
     instance_type: mac_mini_m2
     integrations:
-      app_store_connect: Carraca ASC
+      app_store_connect: sergio
     environment:
       groups:
         - carraca_firma
