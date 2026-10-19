@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carraca - Acceso</title>
+<style>
+body{margin:0;font-family:-apple-system,system-ui,sans-serif;background:#0d0f16;color:#eef1f6}
+.w{max-width:520px;margin:0 auto;padding:34px 22px 60px}h1{font-size:26px;margin:0 0 6px}.sub{color:#a9b1c0;margin:0 0 24px}
+.card{background:#171a24;border-radius:16px;padding:20px;margin-bottom:18px}.card h2{font-size:18px;margin:0 0 8px}
+.card p{color:#a9b1c0;line-height:1.5;font-size:15px;margin:6px 0 14px}
+.btn{display:block;text-align:center;background:#2eb8d1;color:#061218;font-weight:700;text-decoration:none;padding:15px;border-radius:12px;font-size:17px;border:0;width:100%;cursor:pointer}
+.btn.sec{background:#2a2f3c;color:#eef1f6}
+.num{display:inline-block;width:26px;height:26px;border-radius:13px;background:#2eb8d1;color:#061218;text-align:center;font-weight:700;line-height:26px;margin-right:8px}
+input{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;border:1px solid #2a2f3c;background:#0d0f16;color:#eef1f6;font-size:16px;margin-bottom:10px}
+textarea{width:100%;box-sizing:border-box;height:90px;padding:10px;border-radius:10px;background:#0d0f16;color:#2eb8d1;border:1px solid #2a2f3c;font-size:13px}
+.note{font-size:13px;color:#7c8496}.hide{display:none}
+</style></head><body><div class="w">
+
+<!-- ===== Vista del AMIGO (el enlace trae #s=..&u=..&p=..) ===== -->
+<div id="amigo" class="hide">
+  <h1>Carraca</h1><p class="sub">Te han invitado a usar Carraca en tu iPhone o iPad</p>
+  <div class="card">
+    <h2><span class="num">1</span>Instala la app</h2>
+    <p>Se instala con <b>TestFlight</b>, la app oficial de Apple para probar apps. Pulsa el botón, instala TestFlight si te lo pide, y luego <b>Aceptar</b> e <b>Instalar</b>.</p>
+    <a class="btn" id="tf" href="#">Instalar Carraca</a>
+  </div>
+  <div class="card">
+    <h2><span class="num">2</span>Entra con tu cuenta</h2>
+    <p>Cuando la tengas instalada, vuelve a esta página y pulsa aquí: se abrirá Carraca con tus datos ya puestos.</p>
+    <a class="btn" id="open" href="#">Abrir Carraca con mis datos</a>
+  </div>
+  <p class="note">Tus datos solo están en este enlace y en tu dispositivo: no se envían a ninguna web.</p>
+</div>
+
+<!-- ===== Vista del ADMIN (sin datos en el enlace): generador ===== -->
+<div id="admin" class="hide">
+  <h1>Crear enlace de acceso</h1><p class="sub">Rellena los datos de tu amigo y mándale el enlace por WhatsApp.</p>
+  <div class="card">
+    <input id="s" placeholder="Servidor (http://...)" autocapitalize="off" autocorrect="off">
+    <input id="u" placeholder="Usuario" autocapitalize="off" autocorrect="off">
+    <input id="p" placeholder="Contraseña" autocapitalize="off" autocorrect="off">
+    <button class="btn" onclick="gen()">Crear enlace</button>
+  </div>
+  <div class="card hide" id="out">
+    <h2>Enlace listo</h2>
+    <textarea id="link" readonly></textarea>
+    <p></p>
+    <button class="btn" onclick="share()">Compartir / copiar</button>
+  </div>
+  <p class="note">El enlace se genera en tu navegador; esta página no guarda nada.</p>
+</div>
+
+<script>
+// Enlace publico de TestFlight (se rellena cuando Apple apruebe la beta).
+var TESTFLIGHT = "";
+var q = new URLSearchParams(location.hash.slice(1));
+if (q.get("s") || q.get("m3u")) {
+  document.getElementById("amigo").classList.remove("hide");
+  var tf = document.getElementById("tf");
+  if (TESTFLIGHT) { tf.href = TESTFLIGHT; } else { tf.textContent = "Muy pronto"; tf.className = "btn sec"; }
+  var a = new URLSearchParams();
+  ["s","u","p","m3u"].forEach(function(k){ if (q.get(k)) a.set(k, q.get(k)); });
+  document.getElementById("open").href = "carraca://login?" + a.toString();
+} else {
+  document.getElementById("admin").classList.remove("hide");
+}
+function gen() {
+  var a = new URLSearchParams();
+  a.set("s", document.getElementById("s").value.trim());
+  a.set("u", document.getElementById("u").value.trim());
+  a.set("p", document.getElementById("p").value);
+  var l = location.origin + location.pathname + "#" + a.toString();
+  document.getElementById("link").value = l;
+  document.getElementById("out").classList.remove("hide");
+}
+function share() {
+  var l = document.getElementById("link").value;
+  if (navigator.share) { navigator.share({ title: "Carraca", text: "Instala Carraca y entra con este enlace:", url: l }).catch(function(){}); }
+  else if (navigator.clipboard) { navigator.clipboard.writeText(l); alert("Enlace copiado"); }
+}
+</script>
+</div></body></html>

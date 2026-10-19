@@ -24,8 +24,9 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if session.api == nil { LoginView() } else { MainTabView() }
+            if session.isLoggedIn { MainTabView() } else { LoginView() }
         }
+        .onOpenURL { session.handle(url: $0) }
         .alert("Nueva versión disponible",
                isPresented: Binding(get: { session.update != nil }, set: { if !$0 { session.update = nil } })) {
             Button("Actualizar") {
@@ -41,10 +42,17 @@ struct RootView: View {
 // MARK: - Login
 
 struct LoginView: View {
+    private enum Mode: String, CaseIterable, Identifiable {
+        case xtream = "Servidor", m3u = "Lista M3U"
+        var id: String { rawValue }
+    }
+
     @EnvironmentObject private var session: Session
+    @State private var mode = Mode.xtream
     @State private var server = ""
     @State private var user = ""
     @State private var pass = ""
+    @State private var m3u = ""
     @State private var busy = false
     @State private var error: String?
 
@@ -58,21 +66,33 @@ struct LoginView: View {
                     .padding(.top, 56)
                 Text("Carraca").font(.largeTitle.bold())
 
+                Picker("Tipo", selection: $mode) {
+                    ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+
                 VStack(alignment: .leading, spacing: 12) {
-                    field("Servidor (opcional)", text: $server, icon: "server.rack", keyboard: .URL)
-                    Text("Déjalo vacío para usar el servidor Carraca.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .padding(.leading, 4)
-                    field("Usuario", text: $user, icon: "person", keyboard: .asciiCapable)
-                    HStack {
-                        Image(systemName: "lock").foregroundStyle(.secondary).frame(width: 22)
-                        SecureField("Contraseña", text: $pass)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                    if mode == .xtream {
+                        field(Flavor.isPrivate ? "Servidor (opcional)" : "Servidor (http://…)",
+                              text: $server, icon: "server.rack", keyboard: .URL)
+                        if Flavor.isPrivate {
+                            Text("Déjalo vacío para usar el servidor Carraca.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 4)
+                        }
+                        field("Usuario", text: $user, icon: "person", keyboard: .asciiCapable)
+                        HStack {
+                            Image(systemName: "lock").foregroundStyle(.secondary).frame(width: 22)
+                            SecureField("Contraseña", text: $pass)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
+                        .padding(14)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
+                    } else {
+                        field("URL de la lista (http://…/lista.m3u)", text: $m3u, icon: "list.bullet.rectangle", keyboard: .URL)
                     }
-                    .padding(14)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
                 }
 
                 if let error {
@@ -91,13 +111,39 @@ struct LoginView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(busy || user.isEmpty || pass.isEmpty)
+                .disabled(busy || !canSubmit)
+
+                Text("Carraca es un reproductor: no incluye canales, películas ni ningún contenido. Necesitas tu propio servicio o lista.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
             .padding(24)
             .frame(maxWidth: 480)
             .frame(maxWidth: .infinity)
         }
         .background(Color("LaunchBg").ignoresSafeArea())
+        .onAppear(perform: applyPrefill)
+        .onChange(of: session.prefill) { _ in applyPrefill() }
+    }
+
+    private var canSubmit: Bool {
+        mode == .m3u ? !m3u.isEmpty : (!user.isEmpty && !pass.isEmpty && (Flavor.isPrivate || !server.isEmpty))
+    }
+
+    /// Rellena el formulario con los datos del enlace carraca://login
+    private func applyPrefill() {
+        guard let p = session.prefill else { return }
+        if !p.m3u.isEmpty {
+            mode = .m3u
+            m3u = p.m3u
+        } else {
+            mode = .xtream
+            server = p.server
+            user = p.user
+            pass = p.pass
+        }
+        session.prefill = nil
     }
 
     private func field(_ title: String, text: Binding<String>, icon: String, keyboard: UIKeyboardType) -> some View {
@@ -117,7 +163,11 @@ struct LoginView: View {
         error = nil
         defer { busy = false }
         do {
-            try await session.login(server: server, user: user, pass: pass)
+            if mode == .m3u {
+                try await session.loginM3U(m3u)
+            } else {
+                try await session.login(server: server, user: user, pass: pass)
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -132,12 +182,16 @@ struct MainTabView: View {
     var body: some View {
         TabView {
             LiveView().tabItem { Label("Directo", systemImage: "tv") }
-            MoviesView().tabItem { Label("Películas", systemImage: "film") }
-            SeriesView().tabItem { Label("Series", systemImage: "rectangle.stack.badge.play") }
+            if !session.isM3U {
+                MoviesView().tabItem { Label("Películas", systemImage: "film") }
+                SeriesView().tabItem { Label("Series", systemImage: "rectangle.stack.badge.play") }
+            }
             if session.resumeEnabled {
                 ContinueView().tabItem { Label("Seguir", systemImage: "clock.arrow.circlepath") }
             }
-            SportsView().tabItem { Label("Deportes", systemImage: "sportscourt") }
+            if Flavor.isPrivate {
+                SportsView().tabItem { Label("Deportes", systemImage: "sportscourt") }
+            }
         }
     }
 }
@@ -153,8 +207,12 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("Cuenta") {
-                    LabeledContent("Usuario", value: session.creds?.user ?? "-")
-                    LabeledContent("Servidor", value: session.creds?.usesDefaultServer == true ? "Carraca" : (session.creds?.server ?? "-"))
+                    if let m3u = session.creds?.m3u {
+                        LabeledContent("Lista M3U", value: URL(string: m3u)?.host ?? m3u)
+                    } else {
+                        LabeledContent("Usuario", value: session.creds?.user ?? "-")
+                        LabeledContent("Servidor", value: session.creds?.usesDefaultServer == true ? "Carraca" : (session.creds?.server ?? "-"))
+                    }
                     if let exp = session.account?.expDate {
                         LabeledContent("Caduca", value: exp.formatted(date: .long, time: .omitted))
                     }
@@ -179,6 +237,9 @@ struct SettingsView: View {
                 }
                 Section {
                     LabeledContent("Versión", value: "\(AppConfig.version) (\(AppConfig.build))")
+                    Link("Política de privacidad", destination: URL(string: AppConfig.panel + "/ios/privacidad.html")!)
+                } footer: {
+                    Text("Carraca es un reproductor: no incluye ni vende contenido. Tus datos de acceso se guardan solo en este dispositivo.")
                 }
             }
             .navigationTitle("Ajustes")

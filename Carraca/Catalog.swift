@@ -62,12 +62,24 @@ struct LiveView: View {
 
     @MainActor
     private func load(force: Bool = false) async {
-        guard let api = session.api else { return }
         loading = true
         defer { loading = false }
         do {
-            let cats = try await api.liveCategories(force: force)
-            let all = try await api.liveStreams(force: force)
+            var cats: [Category]
+            let all: [LiveStream]
+            if session.isM3U {
+                // En M3U las categorías salen de group-title, en el orden de la lista.
+                all = try await session.m3uChannels(force: force)
+                var seen = Set<String>()
+                cats = []
+                for s in all where seen.insert(s.categoryId).inserted {
+                    cats.append(Category(id: s.categoryId, name: s.categoryId))
+                }
+            } else {
+                guard let api = session.api else { return }
+                cats = try await api.liveCategories(force: force)
+                all = try await api.liveStreams(force: force)
+            }
             var cnt: [String: Int] = [:]
             for s in all { cnt[s.categoryId, default: 0] += 1 }
             counts = cnt
@@ -80,8 +92,11 @@ struct LiveView: View {
     }
 
     private func play(_ s: LiveStream) {
-        guard let api = session.api else { return }
-        playing = PlayItem(url: api.liveURL(s.id), title: s.name, isLive: true, liveStreamId: s.id)
+        if let direct = s.directURL {
+            playing = PlayItem(url: direct, title: s.name, isLive: true)
+        } else if let api = session.api {
+            playing = PlayItem(url: api.liveURL(s.id), title: s.name, isLive: true, liveStreamId: s.id)
+        }
     }
 }
 

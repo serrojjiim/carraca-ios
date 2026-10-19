@@ -155,6 +155,16 @@ struct LiveStream: Decodable, Identifiable, Hashable {
     let name: String
     let icon: String?
     let categoryId: String
+    /// Solo en listas M3U: URL directa del canal.
+    var directURL: URL? = nil
+
+    init(id: Int, name: String, icon: String?, categoryId: String, directURL: URL?) {
+        self.id = id
+        self.name = name
+        self.icon = icon
+        self.categoryId = categoryId
+        self.directURL = directURL
+    }
 
     enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id }
 
@@ -350,8 +360,8 @@ struct ShortEPG: Decodable {
     }
 }
 
-/// Elemento de "Seguir viendo" (resume.php del panel, compartido con Android).
-struct ResumeItem: Decodable, Identifiable, Hashable {
+/// Elemento de "Seguir viendo" (mismo formato que resume.php del panel / app Android).
+struct ResumeItem: Codable, Identifiable, Hashable {
     let type: String
     let name: String
     let itemId: String
@@ -367,6 +377,27 @@ struct ResumeItem: Decodable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey { case type, name, id, url, season, episode, position, duration, pro, ts }
 
+    init(type: String, name: String, itemId: String, url: String, season: Int, episode: Int,
+         position: Int, duration: Int, pro: Int, ts: Int) {
+        self.type = type; self.name = name; self.itemId = itemId; self.url = url
+        self.season = season; self.episode = episode; self.position = position
+        self.duration = duration; self.pro = pro; self.ts = ts
+    }
+
+    func encode(to e: Encoder) throws {
+        var c = e.container(keyedBy: CodingKeys.self)
+        try c.encode(type, forKey: .type)
+        try c.encode(name, forKey: .name)
+        try c.encode(itemId, forKey: .id)
+        try c.encode(url, forKey: .url)
+        try c.encode(season, forKey: .season)
+        try c.encode(episode, forKey: .episode)
+        try c.encode(position, forKey: .position)
+        try c.encode(duration, forKey: .duration)
+        try c.encode(pro, forKey: .pro)
+        try c.encode(ts, forKey: .ts)
+    }
+
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
         type = c.flexString(.type) ?? "movie"
@@ -380,6 +411,66 @@ struct ResumeItem: Decodable, Identifiable, Hashable {
         pro = c.flexInt(.pro) ?? 0
         ts = c.flexInt(.ts) ?? 0
     }
+}
+
+// MARK: - Listas M3U
+
+enum M3U {
+    /// #EXTINF:-1 tvg-logo="..." group-title="Deportes",Nombre  ->  siguiente línea = URL
+    static func parse(_ text: String) -> [LiveStream] {
+        var out: [LiveStream] = []
+        var name = "", logo: String?, group = "Sin categoría"
+        var pending = false
+        for raw in text.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            if line.hasPrefix("#EXTINF") {
+                logo = attr("tvg-logo", in: line)
+                group = attr("group-title", in: line) ?? "Sin categoría"
+                if let comma = line.lastIndex(of: ",") {
+                    name = String(line[line.index(after: comma)...]).trimmingCharacters(in: .whitespaces)
+                } else {
+                    name = ""
+                }
+                pending = true
+            } else if !line.hasPrefix("#"), pending, let url = URL(string: line) {
+                let n = name.isEmpty ? "Canal \(out.count + 1)" : name
+                out.append(LiveStream(id: out.count + 1, name: n, icon: (logo?.isEmpty ?? true) ? nil : logo,
+                                      categoryId: group, directURL: url))
+                pending = false
+            }
+        }
+        return out
+    }
+
+    private static func attr(_ key: String, in line: String) -> String? {
+        guard let r = line.range(of: key + "=\"") else { return nil }
+        let rest = line[r.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[..<end])
+    }
+}
+
+// MARK: - Seguir viendo local (versión genérica: se guarda solo en el dispositivo)
+
+enum LocalResume {
+    private static let key = "carraca.resume"
+
+    static func load() -> [ResumeItem] {
+        guard let d = UserDefaults.standard.data(forKey: key),
+              let list = try? JSONDecoder().decode([ResumeItem].self, from: d) else { return [] }
+        return list
+    }
+
+    static func upsert(_ item: ResumeItem) {
+        var list = load().filter { !($0.type == item.type && $0.name == item.name) }
+        if item.pro < 95 { list.insert(item, at: 0) }
+        if let d = try? JSONEncoder().encode(Array(list.prefix(20))) {
+            UserDefaults.standard.set(d, forKey: key)
+        }
+    }
+
+    static func clear() { UserDefaults.standard.removeObject(forKey: key) }
 }
 
 // MARK: - API Xtream
@@ -525,7 +616,10 @@ struct Credentials: Codable, Equatable {
     var user: String
     var pass: String
     /// true si el usuario dejó el servidor vacío (servidor Carraca, se actualiza solo desde config.json).
+    /// Solo existe en la versión privada (Ad Hoc).
     var usesDefaultServer: Bool
+    /// Si no es nil, la cuenta es una lista M3U (server/user/pass vacíos).
+    var m3u: String? = nil
 }
 
 enum Keychain {

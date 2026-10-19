@@ -1,41 +1,60 @@
-# Compilacion en la nube (Codemagic, Mac M2) -> IPA Ad Hoc firmada.
-# Requisitos en Codemagic (una vez):
-#   - Integracion App Store Connect llamada "Carraca ASC" (clave API de tu cuenta Apple).
-#   - Certificado "Apple Distribution" en Code signing identities (se puede generar alli).
+# Compilacion en la nube (Codemagic, Mac M2). Cuatro flujos:
+#   ios-testflight : version GENERICA -> TestFlight (grupo "Amigos"). Firma automatica.
+#   ios-check      : compila sin firmar (detectar errores, sin cuenta de Apple)
+#   ios-simulator  : build para simulador (probar en appetize.io)
+#   ios-adhoc      : version PRIVADA (servidor Carraca, Deportes...) firmada Ad Hoc
+#
+# Requisitos en Codemagic para firmar:
+#   - Integracion App Store Connect llamada "Carraca ASC" (clave API de la cuenta de Apple).
+#   - Grupo de variables "carraca_firma" con CERTIFICATE_PRIVATE_KEY (clave RSA del certificado).
+
+definitions:
+  scripts:
+    - &xcodegen
+      name: Generar proyecto Xcode
+      script: |
+        brew install xcodegen
+        xcodegen generate
+    - &pods
+      name: Instalar pods (VLC)
+      script: pod install --repo-update
+
 workflows:
-  ios-adhoc:
-    name: Carraca iOS (Ad Hoc)
+  ios-testflight:
+    name: TestFlight (version generica)
     max_build_duration: 60
     instance_type: mac_mini_m2
     integrations:
       app_store_connect: Carraca ASC
     environment:
-      ios_signing:
-        distribution_type: ad_hoc
-        bundle_identifier: com.carraca.smarter
+      groups:
+        - carraca_firma
       xcode: latest
       cocoapods: default
     scripts:
       - name: Numero de build
         script: |
           sed -i '' "s/CURRENT_PROJECT_VERSION: \"1\"/CURRENT_PROJECT_VERSION: \"$BUILD_NUMBER\"/" project.yml
-          grep CURRENT_PROJECT_VERSION project.yml
-      - name: Generar proyecto Xcode
+      - *xcodegen
+      - *pods
+      - name: Firma (crea App ID, certificado y perfil si no existen)
         script: |
-          brew install xcodegen
-          xcodegen generate
-      - name: Instalar pods (VLC)
-        script: pod install --repo-update
-      - name: Aplicar perfiles de firma
-        script: xcode-project use-profiles
+          keychain initialize
+          app-store-connect fetch-signing-files "com.carraca.smarter" --type IOS_APP_STORE --create
+          keychain add-certificates
+          xcode-project use-profiles
       - name: Compilar IPA
         script: xcode-project build-ipa --workspace Carraca.xcworkspace --scheme Carraca
     artifacts:
       - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
+        beta_groups:
+          - Amigos
 
-  # Compila SIN firmar (no necesita cuenta de Apple): sirve para detectar errores
-  # de codigo. Genera Carraca-sin-firmar.ipa (no instalable tal cual en un iPhone).
   ios-check:
     name: Comprobar compilacion (sin firmar)
     max_build_duration: 45
@@ -44,19 +63,14 @@ workflows:
       xcode: latest
       cocoapods: default
     scripts:
-      - name: Generar proyecto Xcode
-        script: |
-          brew install xcodegen
-          xcodegen generate
-      - name: Instalar pods (VLC)
-        script: pod install --repo-update
+      - *xcodegen
+      - *pods
       - name: Compilar sin firma
         script: |
           set -o pipefail
           xcodebuild -workspace Carraca.xcworkspace -scheme Carraca -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/dd \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build \
-            | xcpretty || (echo "---- ERRORES ----"; grep -E "error:" build/xcodebuild.log 2>/dev/null; exit 1)
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | xcpretty
       - name: Empaquetar IPA sin firmar
         script: |
           mkdir -p build/out/Payload
@@ -65,8 +79,6 @@ workflows:
     artifacts:
       - build/out/*.ipa
 
-  # Compilacion para SIMULADOR (sin firma): se sube a appetize.io para probar
-  # la app desde el navegador en Windows. Artefacto: Carraca-simulador.zip
   ios-simulator:
     name: Simulador (para Appetize)
     max_build_duration: 45
@@ -75,12 +87,8 @@ workflows:
       xcode: latest
       cocoapods: default
     scripts:
-      - name: Generar proyecto Xcode
-        script: |
-          brew install xcodegen
-          xcodegen generate
-      - name: Instalar pods (VLC)
-        script: pod install --repo-update
+      - *xcodegen
+      - *pods
       - name: Compilar para simulador
         script: |
           set -o pipefail
@@ -95,3 +103,33 @@ workflows:
           zip -qry ../../../../out/Carraca-simulador.zip Carraca.app
     artifacts:
       - build/out/*.zip
+
+  ios-adhoc:
+    name: Ad Hoc (version privada)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    integrations:
+      app_store_connect: Carraca ASC
+    environment:
+      groups:
+        - carraca_firma
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Version privada + numero de build
+        script: |
+          sed -i '' "s/CURRENT_PROJECT_VERSION: \"1\"/CURRENT_PROJECT_VERSION: \"$BUILD_NUMBER\"/" project.yml
+          sed -i '' 's/^        # FLAVOR.*$/        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) CARRACA_PRIVATE"/' project.yml
+          grep -n "CARRACA_PRIVATE\|CURRENT_PROJECT_VERSION" project.yml
+      - *xcodegen
+      - *pods
+      - name: Firma Ad Hoc (incluye los dispositivos registrados en Apple)
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "com.carraca.smarter" --type IOS_APP_ADHOC --create
+          keychain add-certificates
+          xcode-project use-profiles
+      - name: Compilar IPA
+        script: xcode-project build-ipa --workspace Carraca.xcworkspace --scheme Carraca
+    artifacts:
+      - build/ios/ipa/*.ipa
