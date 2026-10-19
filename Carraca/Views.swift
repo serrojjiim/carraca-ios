@@ -189,8 +189,8 @@ struct MainTabView: View {
             if session.resumeEnabled {
                 ContinueView().tabItem { Label("Seguir", systemImage: "clock.arrow.circlepath") }
             }
-            if Flavor.isPrivate {
-                SportsView().tabItem { Label("Deportes", systemImage: "sportscourt") }
+            if session.showsEvents {
+                SportsView().tabItem { Label("Eventos", systemImage: "sportscourt") }
             }
         }
     }

@@ -26,7 +26,7 @@ struct LiveView: View {
             }
             .navigationTitle("Directo")
             .navigationDestination(for: Category.self) { cat in
-                ChannelListView(title: cat.name, channels: channels(in: cat)) { play($0) }
+                ChannelListView(title: cat.name, channels: channels(in: cat)) { play($0, in: $1) }
             }
             .withSettings()
         }
@@ -42,8 +42,9 @@ struct LiveView: View {
                     NavigationLink(value: c) { CategoryRow(name: c.name, count: counts[c.id] ?? 0) }
                 }
             } else {
-                ForEach(searchResults) { s in
-                    Button { play(s) } label: { ChannelRow(stream: s) }
+                let results = searchResults
+                ForEach(results) { s in
+                    Button { play(s, in: results) } label: { ChannelRow(stream: s) }
                 }
             }
         }
@@ -91,24 +92,30 @@ struct LiveView: View {
         }
     }
 
-    private func play(_ s: LiveStream) {
-        if let direct = s.directURL {
-            playing = PlayItem(url: direct, title: s.name, isLive: true)
-        } else if let api = session.api {
-            playing = PlayItem(url: api.liveURL(s.id), title: s.name, isLive: true, liveStreamId: s.id)
-        }
+    private func play(_ s: LiveStream, in list: [LiveStream]) {
+        let api = session.api
+        let urlFor: (LiveStream) -> URL? = { c in c.directURL ?? api?.liveURL(c.id) }
+        guard let url = urlFor(s) else { return }
+        var item = PlayItem(url: url, title: s.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
+        // Lista para cambiar de canal sin salir (anterior / siguiente).
+        let playable = list.filter { urlFor($0) != nil }
+        item.channels = playable
+        item.channelIndex = playable.firstIndex(of: s) ?? 0
+        item.channelURL = { c in urlFor(c)! }
+        playing = item
     }
 }
 
 struct ChannelListView: View {
     let title: String
     let channels: [LiveStream]
-    let onPlay: (LiveStream) -> Void
+    let onPlay: (LiveStream, [LiveStream]) -> Void
     @State private var query = ""
 
     var body: some View {
-        List(filtered) { s in
-            Button { onPlay(s) } label: { ChannelRow(stream: s) }
+        let list = filtered
+        List(list) { s in
+            Button { onPlay(s, list) } label: { ChannelRow(stream: s) }
         }
         .listStyle(.plain)
         .navigationTitle(title)

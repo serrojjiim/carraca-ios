@@ -35,6 +35,10 @@ struct PlayItem: Identifiable {
     var liveStreamId: Int? = nil
     var startMs = 0
     var resume: ResumeTarget? = nil
+    /// Directo: lista desde la que se abrió el canal, para cambiar a anterior/siguiente.
+    var channels: [LiveStream] = []
+    var channelIndex = 0
+    var channelURL: ((LiveStream) -> URL)? = nil
 }
 
 struct ResumeTarget {
@@ -65,6 +69,17 @@ final class Session: ObservableObject {
 
     var isLoggedIn: Bool { creds != nil }
     var isM3U: Bool { creds?.m3u != nil }
+
+    /// Servidores Carraca conocidos (proxy IPTV + dominio del panel).
+    static let carracaHosts: Set<String> = ["82.165.142.230", "carracaservice.duckdns.org"]
+
+    /// Pestaña "Eventos" (Deportes de hoy del panel): siempre en la privada; en la genérica,
+    /// solo si la cuenta es del servidor Carraca (el resto de usuarios no la ve).
+    var showsEvents: Bool {
+        if Flavor.isPrivate { return true }
+        guard let s = creds?.server, let host = URL(string: s)?.host else { return false }
+        return Session.carracaHosts.contains(host)
+    }
 
     /// Seguir viendo: en la privada lo guarda el panel (si la cuenta es del servidor Carraca);
     /// en la genérica, el propio dispositivo (solo cuentas Xtream, que tienen pelis y series).

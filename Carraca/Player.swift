@@ -146,6 +146,9 @@ struct VLCVideoView: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let v = UIView()
         v.backgroundColor = .black
+        // Las vistas de VLC no deben quedarse con los toques: si no, los controles
+        // de SwiftUI nunca reciben el "tap" y no se puede salir del reproductor.
+        v.isUserInteractionEnabled = false
         controller.player.drawable = v
         return v
     }
@@ -162,14 +165,31 @@ struct PlayerView: View {
     @State private var hideWork: DispatchWorkItem?
     @State private var scrub: Double?
     @State private var epg: [EPGEntry] = []
+    /// Directo: posición del canal actual dentro de item.channels (para anterior/siguiente).
+    @State private var channelIndex: Int?
     private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+
+    private var currentChannel: LiveStream? {
+        guard let i = channelIndex, item.channels.indices.contains(i) else { return nil }
+        return item.channels[i]
+    }
+    private var title: String { currentChannel?.name ?? item.title }
+    private var canZap: Bool { item.isLive && item.channels.count > 1 && item.channelURL != nil }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             VLCVideoView(controller: vlc).ignoresSafeArea()
+            // Capa que recibe los toques encima del vídeo (muestra/oculta los controles).
+            Color.clear
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
+                    if showControls { scheduleHide() }
+                }
             if vlc.buffering && !vlc.failed {
-                ProgressView().controlSize(.large).tint(.white)
+                ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false)
             }
             if vlc.failed {
                 failure
@@ -177,15 +197,11 @@ struct PlayerView: View {
                 controls.transition(.opacity)
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
-            if showControls { scheduleHide() }
-        }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            if item.isLive, !item.channels.isEmpty { channelIndex = item.channelIndex }
             vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
             scheduleHide()
         }
@@ -222,7 +238,7 @@ struct PlayerView: View {
                             .background(.ultraThinMaterial, in: Circle())
                     }
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(item.title).font(.headline).lineLimit(1)
+                        Text(title).font(.headline).lineLimit(1)
                         if let s = item.subtitle { Text(s).font(.subheadline).opacity(0.8).lineLimit(1) }
                         if let now = epg.first { Text("Ahora: \(now.title)").font(.subheadline).lineLimit(1) }
                         if epg.count > 1 { Text("Después: \(epg[1].title)").font(.caption).opacity(0.75).lineLimit(1) }
@@ -237,12 +253,16 @@ struct PlayerView: View {
                 HStack(spacing: 52) {
                     if !item.isLive {
                         Button { vlc.jump(-10); scheduleHide() } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+                    } else if canZap {
+                        Button { zap(-1) } label: { Image(systemName: "backward.end.fill").font(.system(size: 32)) }
                     }
                     Button { vlc.toggle(); scheduleHide() } label: {
                         Image(systemName: vlc.playing ? "pause.fill" : "play.fill").font(.system(size: 46))
                     }
                     if !item.isLive {
                         Button { vlc.jump(30); scheduleHide() } label: { Image(systemName: "goforward.30").font(.system(size: 34)) }
+                    } else if canZap {
+                        Button { zap(1) } label: { Image(systemName: "forward.end.fill").font(.system(size: 32)) }
                     }
                 }
 
@@ -346,9 +366,24 @@ struct PlayerView: View {
         session.report(item, timeMs: final ? len : vlc.timeMs, lengthMs: len)
     }
 
+    /// Canal anterior (-1) o siguiente (+1) de la lista desde la que se abrió.
+    private func zap(_ step: Int) {
+        guard canZap, let i = channelIndex, let urlFor = item.channelURL else { return }
+        let n = item.channels.count
+        let next = ((i + step) % n + n) % n
+        channelIndex = next
+        epg = []
+        vlc.start(url: urlFor(item.channels[next]), startMs: 0, live: true)
+        scheduleHide()
+        Task { await loadEPG() }
+    }
+
     @MainActor
     private func loadEPG() async {
-        guard item.isLive, let id = item.liveStreamId, let api = session.api else { return }
+        guard item.isLive, let api = session.api else { return }
+        // Solo canales Xtream tienen guía (los M3U no traen stream_id del servidor).
+        let id = currentChannel.map { $0.directURL == nil ? $0.id : nil } ?? item.liveStreamId
+        guard let id else { return }
         epg = (try? await api.shortEPG(id)) ?? []
     }
 }
