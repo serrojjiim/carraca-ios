@@ -23,11 +23,13 @@ keychain initialize
 app-store-connect fetch-signing-files "$BUNDLE" --type "$PTYPE" --create   --certificate-key=@env:CERTIFICATE_PRIVATE_KEY
 keychain add-certificates
 
-DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
-echo "== Perfiles descargados =="; ls -la "$DIR" || true
+# Xcode 16+ guarda los perfiles en UserData; versiones anteriores en MobileDevice.
+DIR1="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+DIR2="$HOME/Library/MobileDevice/Provisioning Profiles"
+echo "== Perfiles descargados =="; ls -la "$DIR1" "$DIR2" 2>/dev/null || true
 
 PROFILE=""; NEWEST=0
-for f in "$DIR"/*.mobileprovision; do
+for f in "$DIR1"/*.mobileprovision "$DIR2"/*.mobileprovision; do
   [ -f "$f" ] || continue
   security cms -D -i "$f" > /tmp/p.plist 2>/dev/null || continue
   APPID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" /tmp/p.plist 2>/dev/null || true)
