@@ -376,10 +376,23 @@ struct PlayerView: View {
 
     /// iPhone: el vídeo se abre en horizontal y al salir se vuelve a vertical (en iPad no se fuerza).
     private func setOrientation(_ mask: UIInterfaceOrientationMask) {
-        guard UIDevice.current.userInterfaceIdiom == .phone,
-              let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
-        else { return }
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
+        guard UIDevice.current.userInterfaceIdiom == .phone else { return }
+        // 1) Cambiar lo que la app permite (si no, iOS ignora la petición de giro).
+        AppDelegate.orientationLock = mask
+        for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+            for window in scene.windows {
+                window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+                window.rootViewController?.presentedViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            }
+            // 2) Pedir el giro.
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
+        }
+        // 3) Al volver a vertical, en cuanto gire se vuelve a permitir rotar libremente en las listas.
+        if mask == .portrait {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                AppDelegate.orientationLock = .allButUpsideDown
+            }
+        }
     }
 
     /// Canal anterior (-1) o siguiente (+1) de la lista desde la que se abrió.

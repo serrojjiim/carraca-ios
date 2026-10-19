@@ -1,8 +1,19 @@
 import SwiftUI
 import AVFoundation
 
+/// Controla qué orientaciones permite la app en cada momento (el reproductor fuerza horizontal en iPhone).
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    static var orientationLock: UIInterfaceOrientationMask = .allButUpsideDown
+
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        UIDevice.current.userInterfaceIdiom == .pad ? .all : Self.orientationLock
+    }
+}
+
 @main
 struct CarracaApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var session = Session()
 
     init() {
