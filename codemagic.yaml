@@ -20,6 +20,27 @@ definitions:
       script: pod install --repo-update
 
 workflows:
+  # Prueba rapida de la clave API: registra el identificador de la app (Bundle ID)
+  # y lista lo que hay en la cuenta. No compila nada.
+  ios-registrar:
+    name: Registrar identificador (prueba de la clave API)
+    max_build_duration: 15
+    instance_type: mac_mini_m2
+    integrations:
+      app_store_connect: Carraca ASC
+    scripts:
+      - name: Identificadores existentes
+        script: app-store-connect bundle-ids list --platform IOS || true
+      - name: Registrar com.carraca.smarter
+        script: |
+          if app-store-connect bundle-ids list --bundle-id-identifier com.carraca.smarter --strict-match-identifier | grep -q com.carraca.smarter; then
+            echo "Ya existe com.carraca.smarter"
+          else
+            app-store-connect bundle-ids create com.carraca.smarter --name "Carraca" --platform IOS
+          fi
+      - name: Comprobar
+        script: app-store-connect bundle-ids list --bundle-id-identifier com.carraca.smarter
+
   ios-testflight:
     name: TestFlight (version generica)
     max_build_duration: 60
