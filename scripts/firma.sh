@@ -11,8 +11,16 @@ case "$TIPO" in
   *) echo "tipo desconocido: $TIPO"; exit 1 ;;
 esac
 
+if [ -z "${CERTIFICATE_PRIVATE_KEY:-}" ]; then
+  echo "ERROR: falta la variable CERTIFICATE_PRIVATE_KEY."
+  echo "En Codemagic > app > Environment variables: nombre CERTIFICATE_PRIVATE_KEY,"
+  echo "grupo carraca_firma, valor = contenido completo de certificado.key (BEGIN ... END)."
+  exit 1
+fi
+echo "CERTIFICATE_PRIVATE_KEY presente ($(printf '%s' "$CERTIFICATE_PRIVATE_KEY" | head -1))"
+
 keychain initialize
-app-store-connect fetch-signing-files "$BUNDLE" --type "$PTYPE" --create
+app-store-connect fetch-signing-files "$BUNDLE" --type "$PTYPE" --create   --certificate-key=@env:CERTIFICATE_PRIVATE_KEY
 keychain add-certificates
 
 DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
