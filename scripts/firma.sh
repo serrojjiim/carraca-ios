@@ -45,9 +45,9 @@ lines = (f'        CODE_SIGN_STYLE: Manual\n'
          f'        DEVELOPMENT_TEAM: {team}\n'
          f'        PROVISIONING_PROFILE_SPECIFIER: "{uuid}"\n'
          f'        CODE_SIGN_IDENTITY: "Apple Distribution"\n')
-marker = "        # SIGNING\n"
-assert marker in s, "falta la marca # SIGNING en project.yml"
-s = s.replace(marker, lines, 1)
+import re
+s, n = re.subn(r"^        # SIGNING.*\n", lines, s, count=1, flags=re.M)
+assert n == 1, "falta la marca # SIGNING en project.yml"
 open(p, "w").write(s)
 print("project.yml firmado")
 PY
