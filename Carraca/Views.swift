@@ -221,7 +221,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Cuenta") {
+                Section {
                     if let m3u = session.creds?.m3u {
                         LabeledContent("Lista M3U", value: URL(string: m3u)?.host ?? m3u)
                     } else {
@@ -233,6 +233,12 @@ struct SettingsView: View {
                     }
                     if let max = session.account?.maxConnections {
                         LabeledContent("Conexiones", value: String(max))
+                    }
+                } header: {
+                    Text("Cuenta")
+                } footer: {
+                    if session.remoteResume {
+                        Text("\"Seguir viendo\" se sincroniza con el servidor de tu cuenta: lo que empiezas en la tele lo continúas aquí.")
                     }
                 }
                 Section {

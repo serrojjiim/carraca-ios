@@ -77,13 +77,21 @@ final class Session: ObservableObject {
     /// sin depender de qué servidor usen (nada oculto para la revisión de Apple).
     var showsEvents: Bool { true }
 
-    /// Seguir viendo: en la privada lo guarda el panel (si la cuenta es del servidor Carraca);
-    /// en la genérica, el propio dispositivo (solo cuentas Xtream, que tienen pelis y series).
+    /// Cuenta Xtream del servidor Carraca (el mismo de la app Android).
+    var isCarracaServer: Bool {
+        guard let c = creds, c.m3u == nil else { return false }
+        if c.usesDefaultServer { return true }
+        guard let h = URL(string: c.server)?.host?.lowercased() else { return false }
+        return Session.carracaHosts.contains(h)
+    }
+
+    /// Seguir viendo: con cuentas del servidor Carraca lo guarda el panel (resume.php), así lo
+    /// empezado en la tele sigue en el móvil y al revés; con otros servidores, el propio dispositivo.
     var resumeEnabled: Bool {
         guard let c = creds, c.m3u == nil else { return false }
         return Flavor.isPrivate ? c.usesDefaultServer : true
     }
-    private var remoteResume: Bool { Flavor.isPrivate && creds?.usesDefaultServer == true }
+    var remoteResume: Bool { resumeEnabled && isCarracaServer }
 
     init() {
         if let c = Keychain.load() { apply(c) }
