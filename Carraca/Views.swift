@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 struct CarracaApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var session = Session()
+    @StateObject private var store = Store()
 
     init() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
@@ -25,6 +26,7 @@ struct CarracaApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(session)
+                .environmentObject(store)
                 .preferredColorScheme(.dark)
         }
     }
@@ -32,10 +34,19 @@ struct CarracaApp: App {
 
 struct RootView: View {
     @EnvironmentObject private var session: Session
+    @EnvironmentObject private var store: Store
 
     var body: some View {
         Group {
-            if session.isLoggedIn { MainTabView() } else { LoginView() }
+            if !session.isLoggedIn {
+                LoginView()
+            } else if !store.checked {
+                LoadingView()
+            } else if store.isPremium {
+                MainTabView()
+            } else {
+                PaywallView()
+            }
         }
         .onOpenURL { session.handle(url: $0) }
         .alert("Nueva versión disponible",
@@ -215,8 +226,10 @@ struct MainTabView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var session: Session
+    @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
     @State private var cleared = false
+    @State private var manage = false
 
     var body: some View {
         NavigationStack {
@@ -241,6 +254,18 @@ struct SettingsView: View {
                         Text("\"Seguir viendo\" se sincroniza con el servidor de tu cuenta: lo que empiezas en la tele lo continúas aquí.")
                     }
                 }
+                if !Flavor.isPrivate {
+                    Section("Suscripción") {
+                        LabeledContent("Carraca Premium", value: store.isPremium ? "Activa" : "No activa")
+                        if let e = store.expiration {
+                            LabeledContent(store.willRenew ? "Se renueva" : "Termina",
+                                           value: e.formatted(date: .long, time: .omitted))
+                        }
+                        Button("Gestionar suscripción") { manage = true }
+                        Button("Canjear código") { Task { await store.redeemCode() } }
+                        Button("Restaurar compras") { Task { await store.restore() } }
+                    }
+                }
                 Section {
                     Button(cleared ? "Listas borradas: se recargan al entrar" : "Recargar listas de canales y películas") {
                         DiskCache.clear()
@@ -263,6 +288,7 @@ struct SettingsView: View {
                     Text("Carraca es un reproductor: no incluye ni vende contenido. Tus datos de acceso se guardan solo en este dispositivo.")
                 }
             }
+            .manageSubscriptionsSheet(isPresented: $manage)
             .navigationTitle("Ajustes")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
