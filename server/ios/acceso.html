@@ -22,8 +22,15 @@ textarea{width:100%;box-sizing:border-box;height:90px;padding:10px;border-radius
     <p>Se instala con <b>TestFlight</b>, la app oficial de Apple para probar apps. Pulsa el botón, instala TestFlight si te lo pide, y luego <b>Aceptar</b> e <b>Instalar</b>.</p>
     <a class="btn" id="tf" href="#">Instalar Carraca</a>
   </div>
+  <div class="card hide" id="regalo">
+    <h2><span class="num">2</span>Activa tu suscripción regalada</h2>
+    <p>Tienes <b>Carraca Premium</b> de regalo. Pulsa el botón: se abre la App Store con tu código ya puesto y solo tienes que confirmar.
+    Al terminar el regalo Apple te avisa antes de renovar; si no quieres seguir, cancélala en Ajustes &gt; tu nombre &gt; Suscripciones.</p>
+    <a class="btn" id="redeem" href="#">Activar regalo</a>
+    <p class="note" id="codetxt"></p>
+  </div>
   <div class="card">
-    <h2><span class="num">2</span>Entra con tu cuenta</h2>
+    <h2><span class="num" id="n3">2</span>Entra con tu cuenta</h2>
     <p>Cuando la tengas instalada, vuelve a esta página y pulsa aquí: se abrirá Carraca con tus datos ya puestos.</p>
     <a class="btn" id="open" href="#">Abrir Carraca con mis datos</a>
   </div>
@@ -52,6 +59,8 @@ textarea{width:100%;box-sizing:border-box;height:90px;padding:10px;border-radius
 <script>
 // Enlace publico de TestFlight (se rellena cuando Apple apruebe la beta).
 var TESTFLIGHT = "https://testflight.apple.com/join/K6jKK3WV";
+// Id de Carraca Player en la App Store (para canjear códigos de regalo).
+var APP_ID = "6824508555";
 var q = new URLSearchParams(location.hash.slice(1));
 if (q.get("s") || q.get("m3u")) {
   document.getElementById("amigo").classList.remove("hide");
@@ -60,6 +69,14 @@ if (q.get("s") || q.get("m3u")) {
   var a = new URLSearchParams();
   ["s","u","p","m3u"].forEach(function(k){ if (q.get(k)) a.set(k, q.get(k)); });
   document.getElementById("open").href = "carraca://login?" + a.toString();
+  // Código de oferta de Apple (suscripción regalada)
+  var code = (q.get("c") || "").replace(/[^A-Za-z0-9]/g, "");
+  if (code) {
+    document.getElementById("regalo").classList.remove("hide");
+    document.getElementById("n3").textContent = "3";
+    document.getElementById("redeem").href = "https://apps.apple.com/redeem?ctx=offercodes&id=" + APP_ID + "&code=" + encodeURIComponent(code);
+    document.getElementById("codetxt").textContent = "Tu código: " + code + " (también puedes ponerlo en la app: Ajustes > Canjear código).";
+  }
 } else {
   document.getElementById("admin").classList.remove("hide");
   // Servidor = primera URL de config.json (base_url): solo hay que poner usuario y contraseña.
