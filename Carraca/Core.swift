@@ -129,7 +129,49 @@ extension String {
         }
         return self
     }
+
+    /// "ES| CABEL TV SPORTS ᴿᴬᵂ" -> nombre "Cabel TV Sports" + etiqueta "RAW".
+    var categoryLabel: CategoryLabel {
+        var s = self
+        if let r = s.range(of: #"^[A-Z]{2,4}\s*[-|:]\s*"#, options: .regularExpression) {
+            s = String(s[r.upperBound...])
+        }
+        var words: [String] = []
+        var tags: [String] = []
+        for token in s.split(separator: " ") {
+            let sup = token.filter { superscriptLetters[$0] != nil }.count
+            if sup > 0 && sup * 2 >= token.count {
+                tags.append(token.map { c in superscriptLetters[c].map { String($0) } ?? c.uppercased() }.joined())
+            } else {
+                words.append(String(token))
+            }
+        }
+        var name = words.joined(separator: " ")
+        if name == name.uppercased() {
+            // TODO EN MAYÚSCULAS -> "Películas 2026" (las siglas cortas se quedan: TV, HBO, 4K)
+            name = name.split(separator: " ").map { w in
+                w.count <= 3 ? String(w) : String(w.prefix(1)) + w.dropFirst().lowercased()
+            }.joined(separator: " ")
+        }
+        if name.isEmpty { name = self }
+        return CategoryLabel(name: name, tag: tags.isEmpty ? nil : tags.joined(separator: " "))
+    }
 }
+
+struct CategoryLabel {
+    let name: String
+    let tag: String?
+}
+
+/// Letras "pequeñitas" que el proveedor usa de adorno en los nombres de categoría.
+private let superscriptLetters: [Character: Character] = [
+    "ᴬ": "A", "ᴮ": "B", "ᴰ": "D", "ᴱ": "E", "ᴳ": "G", "ᴴ": "H", "ᴵ": "I", "ᴶ": "J", "ᴷ": "K",
+    "ᴸ": "L", "ᴹ": "M", "ᴺ": "N", "ᴼ": "O", "ᴾ": "P", "ᴿ": "R", "ᵀ": "T", "ᵁ": "U", "ⱽ": "V", "ᵂ": "W",
+    "ᵃ": "A", "ᵇ": "B", "ᶜ": "C", "ᵈ": "D", "ᵉ": "E", "ᶠ": "F", "ᵍ": "G", "ʰ": "H", "ⁱ": "I", "ʲ": "J",
+    "ᵏ": "K", "ˡ": "L", "ᵐ": "M", "ⁿ": "N", "ᵒ": "O", "ᵖ": "P", "ʳ": "R", "ˢ": "S", "ᵗ": "T", "ᵘ": "U",
+    "ᵛ": "V", "ʷ": "W", "ˣ": "X", "ʸ": "Y", "ᶻ": "Z",
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+]
 
 // MARK: - Modelos Xtream
 
@@ -187,8 +229,12 @@ struct VodStream: Decodable, Identifiable, Hashable {
     let categoryId: String
     let ext: String
     let rating: String?
+    /// Fecha de alta en el proveedor (para "Recién añadidas").
+    let added: Int
 
-    enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id, container_extension, rating }
+    var score: Double { Double(rating ?? "") ?? 0 }
+
+    enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id, container_extension, rating, added }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -201,6 +247,7 @@ struct VodStream: Decodable, Identifiable, Hashable {
         categoryId = c.flexString(.category_id) ?? ""
         ext = c.flexString(.container_extension).flatMap { $0.isEmpty ? nil : $0 } ?? "mp4"
         rating = c.flexString(.rating)
+        added = c.flexInt(.added) ?? 0
     }
 }
 
@@ -212,8 +259,11 @@ struct SeriesItem: Decodable, Identifiable, Hashable {
     let plot: String?
     let genre: String?
     let releaseDate: String?
+    /// Imagen horizontal grande (portada destacada).
+    let backdrop: String?
+    let updated: Int
 
-    enum CodingKeys: String, CodingKey { case series_id, name, cover, category_id, plot, genre, releaseDate }
+    enum CodingKeys: String, CodingKey { case series_id, name, cover, category_id, plot, genre, releaseDate, backdrop_path, last_modified }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -227,6 +277,10 @@ struct SeriesItem: Decodable, Identifiable, Hashable {
         plot = c.flexString(.plot)
         genre = c.flexString(.genre)
         releaseDate = c.flexString(.releaseDate)
+        // backdrop_path suele venir como lista de URLs, a veces como texto.
+        let bd = (try? c.decodeIfPresent([String].self, forKey: .backdrop_path))?.first ?? c.flexString(.backdrop_path)
+        backdrop = bd.flatMap { $0.hasPrefix("http") ? $0 : nil }
+        updated = c.flexInt(.last_modified) ?? 0
     }
 }
 

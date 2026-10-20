@@ -8,6 +8,8 @@ struct LiveView: View {
     @State private var categories: [Category] = []
     @State private var streams: [LiveStream] = []
     @State private var counts: [String: Int] = [:]
+    /// Logos de los primeros canales de cada categoría (carátula de la tarjeta).
+    @State private var logos: [String: [String]] = [:]
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
@@ -20,13 +22,16 @@ struct LiveView: View {
                     LoadingView()
                 } else if streams.isEmpty, let error {
                     ErrorView(message: error) { Task { await load(force: true) } }
+                } else if !query.isEmpty {
+                    results
                 } else {
-                    list
+                    grid
                 }
             }
             .navigationTitle("Directo")
+            .searchable(text: $query, prompt: "Buscar canal")
             .navigationDestination(for: Category.self) { cat in
-                ChannelListView(title: cat.name, channels: channels(in: cat)) { play($0, in: $1) }
+                ChannelListView(title: cat.name.categoryLabel.name, channels: channels(in: cat), makeItem: makeItem)
             }
             .withSettings()
         }
@@ -34,34 +39,42 @@ struct LiveView: View {
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
     }
 
-    private var list: some View {
-        List {
-            if query.isEmpty {
-                let favs = channels(in: Category.favorites)
+    private var grid: some View {
+        let favs = channels(in: Category.favorites)
+        return ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12)], spacing: 12) {
                 if !favs.isEmpty {
                     NavigationLink(value: Category.favorites) {
-                        CategoryRow(name: "⭐ Favoritos", count: favs.count)
+                        CategoryCard(name: "Favoritos", tag: nil, count: favs.count,
+                                     logos: favs.compactMap(\.icon).prefix(4).map { $0 }, symbol: "star.fill")
                     }
+                    .buttonStyle(.plain)
                 }
-                NavigationLink(value: Category.all) { CategoryRow(name: "Todos los canales", count: streams.count) }
+                NavigationLink(value: Category.all) {
+                    CategoryCard(name: "Todos los canales", tag: nil, count: streams.count,
+                                 logos: streams.compactMap(\.icon).prefix(4).map { $0 }, symbol: "square.grid.2x2")
+                }
+                .buttonStyle(.plain)
                 ForEach(categories) { c in
-                    NavigationLink(value: c) { CategoryRow(name: c.name, count: counts[c.id] ?? 0) }
-                }
-            } else {
-                let results = searchResults
-                ForEach(results) { s in
-                    Button { play(s, in: results) } label: { ChannelRow(stream: s) }
-                        .favoriteActions(s)
+                    let l = c.name.categoryLabel
+                    NavigationLink(value: c) {
+                        CategoryCard(name: l.name, tag: l.tag, count: counts[c.id] ?? 0, logos: logos[c.id] ?? [])
+                    }
+                    .buttonStyle(.plain)
                 }
             }
+            .padding()
         }
-        .listStyle(.plain)
-        .searchable(text: $query, prompt: "Buscar canal")
         .refreshable { await load(force: true) }
     }
 
-    private var searchResults: [LiveStream] {
-        Array(streams.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300))
+    private var results: some View {
+        let list = Array(streams.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300))
+        return List(list) { s in
+            Button { play(s, in: list) } label: { ChannelRow(stream: s) }
+                .favoriteActions(s)
+        }
+        .listStyle(.plain)
     }
 
     private func channels(in cat: Category) -> [LiveStream] {
@@ -93,8 +106,13 @@ struct LiveView: View {
                 all = try await api.liveStreams(force: force)
             }
             var cnt: [String: Int] = [:]
-            for s in all { cnt[s.categoryId, default: 0] += 1 }
+            var lg: [String: [String]] = [:]
+            for s in all {
+                cnt[s.categoryId, default: 0] += 1
+                if let i = s.icon, (lg[s.categoryId]?.count ?? 0) < 4 { lg[s.categoryId, default: []].append(i) }
+            }
             counts = cnt
+            logos = lg
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             streams = all
             error = nil
@@ -103,39 +121,193 @@ struct LiveView: View {
         }
     }
 
-    private func play(_ s: LiveStream, in list: [LiveStream]) {
+    /// Qué reproducir para un canal, con la lista para cambiar a anterior / siguiente.
+    private func makeItem(_ s: LiveStream, _ list: [LiveStream]) -> PlayItem? {
         let api = session.api
         let urlFor: (LiveStream) -> URL? = { c in c.directURL ?? api?.liveURL(c.id) }
-        guard let url = urlFor(s) else { return }
+        guard let url = urlFor(s) else { return nil }
         var item = PlayItem(url: url, title: s.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
-        // Lista para cambiar de canal sin salir (anterior / siguiente).
         let playable = list.filter { urlFor($0) != nil }
         item.channels = playable
         item.channelIndex = playable.firstIndex(of: s) ?? 0
         item.channelURL = { c in urlFor(c)! }
-        playing = item
+        return item
+    }
+
+    private func play(_ s: LiveStream, in list: [LiveStream]) {
+        playing = makeItem(s, list)
     }
 }
 
+/// Lista de canales de una categoría con vista previa arriba.
+/// Un toque: vista previa sin sonido (tras 1 s quieto, para no abrir canales en ráfaga:
+/// el proveedor banea la IP). Segundo toque, tocar la previa o el botón: pantalla completa.
 struct ChannelListView: View {
     let title: String
     let channels: [LiveStream]
-    let onPlay: (LiveStream, [LiveStream]) -> Void
+    let makeItem: (LiveStream, [LiveStream]) -> PlayItem?
+
+    @EnvironmentObject private var session: Session
+    @Environment(\.scenePhase) private var phase
+    @StateObject private var preview = VLCController()
     @State private var query = ""
+    @State private var selected: LiveStream?
+    @State private var pending: Task<Void, Never>?
+    @State private var epg: [EPGEntry] = []
+    @State private var playing: PlayItem?
+
+    private static let hm: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
 
     var body: some View {
         let list = filtered
-        List(list) { s in
-            Button { onPlay(s, list) } label: { ChannelRow(stream: s) }
+        VStack(spacing: 0) {
+            previewBox(list)
+            List(list) { s in
+                HStack(spacing: 12) {
+                    RemoteImage(url: s.icon, contentMode: .fit)
+                        .frame(width: 60, height: 40)
+                        .background(Color.white.opacity(0.04))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Text(s.name).lineLimit(1).foregroundStyle(.primary)
+                    if session.isFavorite(s) {
+                        Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
+                    }
+                    Spacer()
+                    Button { open(s, in: list) } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .padding(8)
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { tap(s, in: list) }
+                .listRowBackground(selected == s ? Color.accentColor.opacity(0.18) : Color.clear)
                 .favoriteActions(s)
+            }
+            .listStyle(.plain)
         }
-        .listStyle(.plain)
         .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $query, prompt: "Buscar en \(title)")
+        .onDisappear { stopPreview() }
+        .onChange(of: phase) { p in if p != .active { stopPreview() } }
+        .fullScreenCover(item: $playing, onDismiss: {
+            if let s = selected { schedulePreview(s, delay: 0.6) }
+        }) { PlayerView(item: $0) }
+    }
+
+    @ViewBuilder
+    private func previewBox(_ list: [LiveStream]) -> some View {
+        if let s = selected {
+            VStack(alignment: .leading, spacing: 6) {
+                ZStack {
+                    Color.black
+                    VLCVideoView(controller: preview)
+                    if preview.failed {
+                        Text("No disponible ahora mismo").font(.caption).foregroundStyle(.white.opacity(0.8))
+                    } else if preview.buffering || !preview.playing {
+                        ProgressView().tint(.white)
+                    }
+                    // Tocar la previa: pantalla completa.
+                    Color.clear.contentShape(Rectangle()).onTapGesture { open(s, in: list) }
+                }
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(alignment: .bottomTrailing) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                        .padding(8)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .padding(8)
+                        .allowsHitTesting(false)
+                }
+                .overlay(alignment: .topTrailing) {
+                    Button {
+                        stopPreview()
+                        selected = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.bold())
+                            .foregroundStyle(.white)
+                            .padding(8)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .padding(8)
+                }
+                .frame(maxWidth: 560)
+
+                Text(s.name).font(.headline).lineLimit(1)
+                if let now = epg.first {
+                    Text("Ahora: \(now.title)\(range(now))").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if epg.count > 1 {
+                    Text("Después: \(epg[1].title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+        } else {
+            Label("Toca un canal para verlo aquí. Tócalo otra vez para pantalla completa.", systemImage: "hand.tap")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     private var filtered: [LiveStream] {
         query.isEmpty ? channels : channels.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    private func range(_ e: EPGEntry) -> String {
+        guard let a = e.start, let b = e.end else { return "" }
+        return " · " + Self.hm.string(from: a) + "–" + Self.hm.string(from: b)
+    }
+
+    private func tap(_ s: LiveStream, in list: [LiveStream]) {
+        if selected == s {
+            open(s, in: list)
+        } else {
+            selected = s
+            schedulePreview(s, delay: 1.0)
+        }
+    }
+
+    /// Una sola previa a la vez: se corta la anterior al momento y la nueva arranca
+    /// solo si el canal sigue elegido pasado el retardo.
+    private func schedulePreview(_ s: LiveStream, delay: Double) {
+        pending?.cancel()
+        preview.halt()
+        epg = []
+        pending = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, selected == s, playing == nil, let item = makeItem(s, [s]) else { return }
+            preview.start(url: item.url, startMs: 0, live: true, muted: true)
+            guard let id = item.liveStreamId, let api = session.api else { return }
+            let list = (try? await api.shortEPG(id)) ?? []
+            if selected == s { epg = list }
+        }
+    }
+
+    private func stopPreview() {
+        pending?.cancel()
+        pending = nil
+        preview.halt()
+    }
+
+    private func open(_ s: LiveStream, in list: [LiveStream]) {
+        stopPreview()
+        selected = s
+        playing = makeItem(s, list)
     }
 }
 
@@ -194,9 +366,15 @@ struct ChannelRow: View {
 
 struct MoviesView: View {
     @EnvironmentObject private var session: Session
+    @Environment(\.horizontalSizeClass) private var hsize
     @State private var categories: [Category] = []
     @State private var movies: [VodStream] = []
     @State private var counts: [String: Int] = [:]
+    /// Películas de cada categoría, de la más nueva a la más antigua.
+    @State private var byCategory: [String: [VodStream]] = [:]
+    @State private var byName: [String: VodStream] = [:]
+    @State private var recent: [VodStream] = []
+    @State private var top: [VodStream] = []
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
@@ -211,24 +389,51 @@ struct MoviesView: View {
                 } else if !query.isEmpty {
                     VodGrid(items: Array(movies.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
                 } else {
-                    List {
-                        ForEach(categories) { c in
-                            NavigationLink(value: c) { CategoryRow(name: c.name, count: counts[c.id] ?? 0) }
-                        }
-                    }
-                    .listStyle(.plain)
-                    .refreshable { await load(force: true) }
+                    home
                 }
             }
             .navigationTitle("Películas")
             .searchable(text: $query, prompt: "Buscar película")
             .navigationDestination(for: Category.self) { cat in
-                VodGrid(items: movies.filter { $0.categoryId == cat.id }).navigationTitle(cat.name)
+                VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
             }
             .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
             .withSettings()
         }
         .task { if movies.isEmpty { await load() } }
+    }
+
+    private var home: some View {
+        let w: CGFloat = hsize == .regular ? 150 : 112
+        let cont = continuing
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 24) {
+                if !cont.isEmpty {
+                    PosterRail("Seguir viendo", items: cont, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                               progress: { m in session.resumeFor(movie: m.name).map { Double($0.pro) / 100 } })
+                }
+                if !recent.isEmpty {
+                    PosterRail("Recién añadidas", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.icon })
+                }
+                if !top.isEmpty {
+                    PosterRail("Mejor valoradas", items: top, width: w, title: { $0.name.cleanTitle }, image: { $0.icon })
+                }
+                ForEach(categories) { c in
+                    let l = c.name.categoryLabel
+                    PosterRail(l.name, tag: l.tag, seeAll: c, count: counts[c.id] ?? 0,
+                               items: Array((byCategory[c.id] ?? []).prefix(20)), width: w,
+                               title: { $0.name.cleanTitle }, image: { $0.icon })
+                }
+            }
+            .padding(.vertical)
+        }
+        .refreshable { await load(force: true) }
+    }
+
+    /// Lo que se dejó a medias (de "Seguir viendo"), como carátulas.
+    private var continuing: [VodStream] {
+        var seen = Set<Int>()
+        return session.resume.filter { $0.type == "movie" }.compactMap { byName[$0.name] }.filter { seen.insert($0.id).inserted }
     }
 
     @MainActor
@@ -239,9 +444,19 @@ struct MoviesView: View {
         do {
             let cats = try await api.vodCategories(force: force)
             let all = try await api.vodStreams(force: force)
+            let newest = all.sorted { $0.added > $1.added }
             var cnt: [String: Int] = [:]
-            for m in all { cnt[m.categoryId, default: 0] += 1 }
+            var by: [String: [VodStream]] = [:]
+            for m in newest {
+                cnt[m.categoryId, default: 0] += 1
+                by[m.categoryId, default: []].append(m)
+            }
             counts = cnt
+            byCategory = by
+            byName = Dictionary(all.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+            recent = Array(newest.prefix(20))
+            // Mejor nota entre las ~600 más recientes (en el catálogo antiguo hay notas sin sentido).
+            top = Array(newest.prefix(600).filter { $0.score >= 6.5 && $0.score < 10 }.sorted { $0.score > $1.score }.prefix(20))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             movies = all
             error = nil
@@ -343,9 +558,14 @@ func timeText(_ ms: Int) -> String {
 
 struct SeriesView: View {
     @EnvironmentObject private var session: Session
+    @Environment(\.horizontalSizeClass) private var hsize
     @State private var categories: [Category] = []
     @State private var items: [SeriesItem] = []
     @State private var counts: [String: Int] = [:]
+    /// Series de cada categoría, de la actualizada más reciente a la más antigua.
+    @State private var byCategory: [String: [SeriesItem]] = [:]
+    @State private var byName: [String: SeriesItem] = [:]
+    @State private var recent: [SeriesItem] = []
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
@@ -360,24 +580,54 @@ struct SeriesView: View {
                 } else if !query.isEmpty {
                     SeriesGrid(items: Array(items.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
                 } else {
-                    List {
-                        ForEach(categories) { c in
-                            NavigationLink(value: c) { CategoryRow(name: c.name, count: counts[c.id] ?? 0) }
-                        }
-                    }
-                    .listStyle(.plain)
-                    .refreshable { await load(force: true) }
+                    home
                 }
             }
             .navigationTitle("Series")
             .searchable(text: $query, prompt: "Buscar serie")
             .navigationDestination(for: Category.self) { cat in
-                SeriesGrid(items: items.filter { $0.categoryId == cat.id }).navigationTitle(cat.name)
+                SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
             }
             .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
             .withSettings()
         }
         .task { if items.isEmpty { await load() } }
+    }
+
+    private var home: some View {
+        let w: CGFloat = hsize == .regular ? 150 : 112
+        let cont = continuing
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 24) {
+                if let hero = recent.first(where: { $0.backdrop != nil }) {
+                    NavigationLink(value: hero) { HeroBanner(series: hero, height: hsize == .regular ? 320 : 200) }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal)
+                }
+                if !cont.isEmpty {
+                    PosterRail("Seguir viendo", items: cont, width: w, title: { $0.name.cleanTitle }, image: { $0.cover },
+                               progress: { s in session.resumeFor(series: s.name).map { Double($0.pro) / 100 } })
+                }
+                if !recent.isEmpty {
+                    PosterRail("Con capítulos nuevos", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
+                }
+                ForEach(categories) { c in
+                    let l = c.name.categoryLabel
+                    PosterRail(l.name, tag: l.tag, seeAll: c, count: counts[c.id] ?? 0,
+                               items: Array((byCategory[c.id] ?? []).prefix(20)), width: w,
+                               title: { $0.name.cleanTitle }, image: { $0.cover })
+                }
+            }
+            .padding(.vertical)
+        }
+        .refreshable { await load(force: true) }
+    }
+
+    private var continuing: [SeriesItem] {
+        var seen = Set<Int>()
+        return session.resume.filter { $0.type == "series" }
+            .compactMap { byName[$0.name] ?? byName[$0.name.seriesBaseName] }
+            .filter { seen.insert($0.id).inserted }
     }
 
     @MainActor
@@ -388,15 +638,50 @@ struct SeriesView: View {
         do {
             let cats = try await api.seriesCategories(force: force)
             let all = try await api.series(force: force)
+            let newest = all.sorted { $0.updated > $1.updated }
             var cnt: [String: Int] = [:]
-            for s in all { cnt[s.categoryId, default: 0] += 1 }
+            var by: [String: [SeriesItem]] = [:]
+            for s in newest {
+                cnt[s.categoryId, default: 0] += 1
+                by[s.categoryId, default: []].append(s)
+            }
             counts = cnt
+            byCategory = by
+            byName = Dictionary(all.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+            recent = Array(newest.prefix(20))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             items = all
             error = nil
         } catch {
             self.error = error.localizedDescription
         }
+    }
+}
+
+/// Portada grande de una serie (imagen horizontal + título).
+struct HeroBanner: View {
+    let series: SeriesItem
+    let height: CGFloat
+
+    var body: some View {
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+            .overlay { RemoteImage(url: series.backdrop) }
+            .overlay {
+                LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .center, endPoint: .bottom)
+            }
+            .overlay(alignment: .bottomLeading) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(series.name.cleanTitle).font(.title2.bold()).lineLimit(2)
+                    if let g = series.genre, !g.isEmpty {
+                        Text(g).font(.subheadline).opacity(0.85).lineLimit(1)
+                    }
+                }
+                .foregroundStyle(.white)
+                .padding()
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 }
 

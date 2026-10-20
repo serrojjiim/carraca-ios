@@ -20,19 +20,25 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var url: URL?
     private var live = false
     private var retries = 0
+    private var muted = false
+    /// true tras halt(): los reintentos pendientes ya no deben arrancar nada.
+    private var halted = false
 
     override init() {
         super.init()
         player.delegate = self
     }
 
-    func start(url: URL, startMs: Int, live: Bool) {
+    func start(url: URL, startMs: Int, live: Bool, muted: Bool = false) {
         self.url = url
         self.live = live
+        self.muted = muted
+        halted = false
         failed = false
         buffering = true
         let media = VLCMedia(url: url)
-        media.addOption(":network-caching=\(live ? 2500 : 4000)")
+        media.addOption(":network-caching=\(live ? (muted ? 1500 : 2500) : 4000)")
+        if muted { media.addOption(":no-audio") }
         if startMs > 0 { media.addOption(":start-time=\(Double(startMs) / 1000.0)") }
         player.media = media
         player.play()
@@ -59,6 +65,16 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func stop() {
         player.delegate = nil
         player.stop()
+    }
+
+    /// Para la reproducción pero deja el controlador listo para otro start() (vista previa).
+    func halt() {
+        halted = true
+        retries = 0
+        player.stop()
+        playing = false
+        buffering = false
+        failed = false
     }
 
     // MARK: Pistas de audio y subtítulos
@@ -124,6 +140,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     /// Como mucho 3 reintentos y con pausa creciente: el proveedor banea las ráfagas.
     private func handleError() {
+        if halted { return }
         guard retries < 3, let url else {
             failed = true
             buffering = false
@@ -134,8 +151,10 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         buffering = true
         let resumeAt = live ? 0 : timeMs
         let isLive = live
+        let isMuted = muted
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(3 * retries)) { [weak self] in
-            self?.start(url: url, startMs: resumeAt, live: isLive)
+            guard let self, !self.halted, self.url == url else { return }
+            self.start(url: url, startMs: resumeAt, live: isLive, muted: isMuted)
         }
     }
 }

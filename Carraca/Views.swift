@@ -380,3 +380,117 @@ struct ErrorView: View {
 }
 
 let posterColumns = [GridItem(.adaptive(minimum: 108, maximum: 170), spacing: 12)]
+
+/// Etiqueta pequeña (RAW, 4K, 60FPS…) sacada del nombre de la categoría.
+struct TagChip: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .foregroundStyle(Color.accentColor)
+            .background(Color.accentColor.opacity(0.18), in: RoundedRectangle(cornerRadius: 4))
+    }
+}
+
+/// Fila horizontal de carátulas (estilo Netflix) con "Ver todo".
+struct PosterRail<T: Identifiable & Hashable>: View {
+    let title: String
+    let tag: String?
+    let seeAll: Category?
+    let count: Int
+    let items: [T]
+    let width: CGFloat
+    let titleOf: (T) -> String
+    let imageOf: (T) -> String?
+    let progressOf: (T) -> Double?
+
+    init(_ title: String, tag: String? = nil, seeAll: Category? = nil, count: Int = 0, items: [T], width: CGFloat,
+         title titleOf: @escaping (T) -> String, image imageOf: @escaping (T) -> String?,
+         progress progressOf: @escaping (T) -> Double? = { _ in nil }) {
+        self.title = title
+        self.tag = tag
+        self.seeAll = seeAll
+        self.count = count
+        self.items = items
+        self.width = width
+        self.titleOf = titleOf
+        self.imageOf = imageOf
+        self.progressOf = progressOf
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text(title).font(.title3.bold()).lineLimit(1)
+                if let tag { TagChip(text: tag) }
+                Spacer(minLength: 8)
+                if let seeAll {
+                    NavigationLink(value: seeAll) {
+                        HStack(spacing: 3) {
+                            Text(count > 0 ? "Ver \(count)" : "Ver todo")
+                            Image(systemName: "chevron.right")
+                        }
+                        .font(.subheadline)
+                    }
+                }
+            }
+            .padding(.horizontal)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 12) {
+                    ForEach(items) { it in
+                        NavigationLink(value: it) {
+                            PosterCell(title: titleOf(it), image: imageOf(it), progress: progressOf(it))
+                                .frame(width: width)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal)
+            }
+        }
+    }
+}
+
+/// Tarjeta de categoría de directo: logos de sus primeros canales + nombre + nº de canales.
+struct CategoryCard: View {
+    let name: String
+    let tag: String?
+    let count: Int
+    let logos: [String]
+    var symbol: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                ForEach(0..<4, id: \.self) { i in
+                    Group {
+                        if i < logos.count {
+                            RemoteImage(url: logos[i], contentMode: .fit).padding(3)
+                        } else {
+                            Color.clear
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                    .background(Color.white.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            HStack(spacing: 5) {
+                if let symbol { Image(systemName: symbol).font(.caption).foregroundStyle(.yellow) }
+                Text(name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                if let tag { TagChip(text: tag) }
+            }
+            Text("\(count) canales").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.06)))
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
