@@ -4,7 +4,8 @@ use_frameworks!
 target 'Carraca' do
   # Motor VLC: reproduce TS (directo) y MKV/AVI (pelis y series), que el
   # reproductor nativo de iOS no soporta.
-  pod 'MobileVLCKit', '~> 3.6.0'
+  # Rama experimental: VLCKit 4 (alpha) para Picture in Picture.
+  pod 'VLCKit', '4.0.0a25'
 end
 
 post_install do |installer|

@@ -1,12 +1,12 @@
 import SwiftUI
-import MobileVLCKit
+import VLCKit
 
 struct Track: Identifiable, Hashable {
     let id: Int32
     let name: String
 }
 
-/// Envoltorio del motor VLC (reproduce TS, MKV, AVI…).
+/// Envoltorio del motor VLC 4 (reproduce TS, MKV, AVI…) con imagen en imagen (PiP).
 final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let player = VLCMediaPlayer()
 
@@ -16,12 +16,17 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var lengthMs = 0
     @Published var failed = false
     @Published var ended = false
+    /// PiP listo para usarse (VLC lo avisa cuando la vista ya está montada).
+    @Published var pipAvailable = false
+    @Published var pipActive = false
+
+    weak var pipController: VLCPictureInPictureWindowControlling?
 
     private var url: URL?
     private var live = false
     private var retries = 0
     private var muted = false
-    /// true tras halt(): los reintentos pendientes ya no deben arrancar nada.
+    /// true tras halt()/stop(): los reintentos pendientes y el "stopped" que llega después se ignoran.
     private var halted = false
 
     override init() {
@@ -35,8 +40,9 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         self.muted = muted
         halted = false
         failed = false
+        ended = false
         buffering = true
-        let media = VLCMedia(url: url)
+        guard let media = VLCMedia(url: url) else { failed = true; return }
         media.addOption(":network-caching=\(live ? (muted ? 1500 : 2500) : 4000)")
         if muted { media.addOption(":no-audio") }
         if startMs > 0 { media.addOption(":start-time=\(Double(startMs) / 1000.0)") }
@@ -55,14 +61,16 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func seek(toFraction f: Double) {
-        player.position = Float(max(0, min(1, f)))
+        player.position = max(0, min(1, f))
     }
 
     func jump(_ seconds: Int32) {
-        if seconds >= 0 { player.jumpForward(seconds) } else { player.jumpBackward(-seconds) }
+        if seconds >= 0 { player.jumpForward(Double(seconds)) } else { player.jumpBackward(Double(-seconds)) }
     }
 
     func stop() {
+        halted = true
+        if pipActive { pipController?.stopPictureInPicture() }
         player.delegate = nil
         player.stop()
     }
@@ -77,51 +85,81 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         failed = false
     }
 
+    // MARK: Imagen en imagen
+
+    func togglePiP() {
+        guard let c = pipController else { return }
+        if pipActive { c.stopPictureInPicture() } else { c.startPictureInPicture() }
+    }
+
+    func startPiP() {
+        guard !pipActive, player.isPlaying else { return }
+        pipController?.startPictureInPicture()
+    }
+
     // MARK: Pistas de audio y subtítulos
 
-    var audioTracks: [Track] { tracks(player.audioTrackIndexes, player.audioTrackNames) }
-    var subtitleTracks: [Track] { tracks(player.videoSubTitlesIndexes, player.videoSubTitlesNames) }
-    var currentAudio: Int32 { player.currentAudioTrackIndex }
-    var currentSubtitle: Int32 { player.currentVideoSubTitleIndex }
+    var audioTracks: [Track] {
+        player.audioTracks.enumerated().map { Track(id: Int32($0.offset), name: $0.element.trackName) }
+    }
+
+    /// Con "Desactivados" (-1) al principio, como en VLC 3.
+    var subtitleTracks: [Track] {
+        let list = player.textTracks.enumerated().map { Track(id: Int32($0.offset), name: $0.element.trackName) }
+        return list.isEmpty ? [] : [Track(id: -1, name: "Desactivados")] + list
+    }
+
+    var currentAudio: Int32 {
+        Int32(player.audioTracks.firstIndex(where: { $0.isSelected }) ?? -1)
+    }
+
+    var currentSubtitle: Int32 {
+        Int32(player.textTracks.firstIndex(where: { $0.isSelected }) ?? -1)
+    }
 
     func setAudio(_ id: Int32) {
-        player.currentAudioTrackIndex = id
+        let list = player.audioTracks
+        if list.indices.contains(Int(id)) { list[Int(id)].isSelectedExclusively = true }
         objectWillChange.send()
     }
 
     func setSubtitle(_ id: Int32) {
-        player.currentVideoSubTitleIndex = id
+        let list = player.textTracks
+        if id < 0 {
+            player.deselectAllTextTracks()
+        } else if list.indices.contains(Int(id)) {
+            list[Int(id)].isSelectedExclusively = true
+        }
         objectWillChange.send()
-    }
-
-    private func tracks(_ indexes: [Any]?, _ names: [Any]?) -> [Track] {
-        let ids = (indexes ?? []).compactMap { ($0 as? NSNumber)?.int32Value }
-        let titles = (names ?? []).map { "\($0)" }
-        return zip(ids, titles).map { Track(id: $0, name: $1) }
     }
 
     // MARK: VLCMediaPlayerDelegate
 
-    func mediaPlayerStateChanged(_ aNotification: Notification) {
+    func mediaPlayerStateChanged(_ newState: VLCMediaPlayerState) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            switch self.player.state {
+            switch newState {
             case .opening:
                 self.buffering = true
-            case .buffering:
-                if !self.player.isPlaying { self.buffering = true }
             case .playing:
                 self.buffering = false
                 self.playing = true
                 self.retries = 0
+                self.pipController?.invalidatePlaybackState()
             case .paused:
                 self.playing = false
+                self.pipController?.invalidatePlaybackState()
             case .error:
                 self.handleError()
-            case .ended:
-                if self.live { self.handleError() } else { self.ended = true }
             case .stopped:
                 self.playing = false
+                guard !self.halted else { return }
+                // VLC 4 no tiene estado "ended": si para solo, o ha llegado al final o se ha cortado.
+                if !self.live, self.lengthMs > 0, self.timeMs >= self.lengthMs - 5000 {
+                    self.ended = true
+                } else {
+                    self.handleError()
+                }
             default:
                 break
             }
@@ -159,8 +197,69 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 }
 
+/// "Drawable" de VLC 4: VLC monta su vista de vídeo dentro de `view` y, como también es
+/// VLCPictureInPictureDrawable, prepara el modo imagen en imagen (mismo esquema que la app de VLC).
+final class VLCDrawableHost: NSObject, VLCDrawable, VLCPictureInPictureDrawable, VLCPictureInPictureMediaControlling {
+    let view: UIView
+    weak var controller: VLCController?
+
+    init(view: UIView, controller: VLCController) {
+        self.view = view
+        self.controller = controller
+    }
+
+    // VLCDrawable
+    func addSubview(_ subview: UIView!) {
+        view.addSubview(subview)
+        subview.frame = view.bounds
+        subview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        subview.isUserInteractionEnabled = false
+    }
+
+    func bounds() -> CGRect { view.bounds }
+
+    // VLCPictureInPictureDrawable
+    func mediaController() -> VLCPictureInPictureMediaControlling! { self }
+
+    func pictureInPictureReady() -> ((VLCPictureInPictureWindowControlling?) -> Void)! {
+        { [weak self] pip in
+            // (según la cabecera el parámetro puede venir como opcional o no: así vale para los dos)
+            let ctl: VLCPictureInPictureWindowControlling? = pip
+            guard let c = self?.controller, let pip = ctl else { return }
+            DispatchQueue.main.async {
+                c.pipController = pip
+                c.pipAvailable = true
+                pip.stateChangeEventHandler = { [weak c] started in
+                    DispatchQueue.main.async {
+                        guard let c else { return }
+                        c.pipActive = started
+                        // Se cierra la ventanita estando fuera de la app: se pausa (como en el resto de apps).
+                        if !started, UIApplication.shared.applicationState != .active { c.player.pause() }
+                    }
+                }
+            }
+        }
+    }
+
+    // VLCPictureInPictureMediaControlling
+    func play() { controller?.player.play() }
+    func pause() { controller?.player.pause() }
+
+    func seek(by offset: Int64, completion: (() -> Void)!) {
+        controller?.player.jump(withOffset: Int32(offset), completion: completion)
+    }
+
+    func mediaLength() -> Int64 { controller?.player.media?.length.value?.int64Value ?? 0 }
+    func mediaTime() -> Int64 { controller?.player.time.value?.int64Value ?? 0 }
+    func isMediaSeekable() -> Bool { controller?.player.isSeekable ?? false }
+    func isMediaPlaying() -> Bool { controller?.player.isPlaying ?? false }
+}
+
 struct VLCVideoView: UIViewRepresentable {
     let controller: VLCController
+
+    final class Coordinator { var host: VLCDrawableHost? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> UIView {
         let v = UIView()
@@ -168,7 +267,9 @@ struct VLCVideoView: UIViewRepresentable {
         // Las vistas de VLC no deben quedarse con los toques: si no, los controles
         // de SwiftUI nunca reciben el "tap" y no se puede salir del reproductor.
         v.isUserInteractionEnabled = false
-        controller.player.drawable = v
+        let host = VLCDrawableHost(view: v, controller: controller)
+        context.coordinator.host = host
+        controller.player.drawable = host
         return v
     }
 
@@ -238,6 +339,9 @@ struct PlayerView: View {
             setOrientation(.portrait)
         }
         .onReceive(tick) { _ in report() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            vlc.startPiP()
+        }
         .onChange(of: vlc.ended) { done in
             if done {
                 report(final: true)
@@ -271,6 +375,14 @@ struct PlayerView: View {
                         if epg.count > 1 { Text("Después: \(epg[1].title)").font(.caption).opacity(0.75).lineLimit(1) }
                     }
                     Spacer()
+                    if vlc.pipAvailable {
+                        Button { vlc.togglePiP(); scheduleHide() } label: {
+                            Image(systemName: vlc.pipActive ? "pip.exit" : "pip.enter")
+                                .font(.title3)
+                                .padding(12)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                    }
                     if !vlc.audioTracks.isEmpty || !vlc.subtitleTracks.isEmpty { tracksMenu }
                 }
                 .padding()
