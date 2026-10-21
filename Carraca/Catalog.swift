@@ -413,16 +413,19 @@ struct MoviesView: View {
                                progress: { m in session.resumeFor(movie: m.name).map { Double($0.pro) / 100 } })
                 }
                 if !recent.isEmpty {
-                    PosterRail("Recién añadidas", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.icon })
+                    PosterRail("Recién añadidas", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                               watched: { session.isWatched(movie: $0.name) })
                 }
                 if !top.isEmpty {
-                    PosterRail("Mejor valoradas", items: top, width: w, title: { $0.name.cleanTitle }, image: { $0.icon })
+                    PosterRail("Mejor valoradas", items: top, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                               watched: { session.isWatched(movie: $0.name) })
                 }
                 ForEach(categories) { c in
                     let l = c.name.categoryLabel
                     PosterRail(l.name, tag: l.tag, seeAll: c, count: counts[c.id] ?? 0,
                                items: Array((byCategory[c.id] ?? []).prefix(20)), width: w,
-                               title: { $0.name.cleanTitle }, image: { $0.icon })
+                               title: { $0.name.cleanTitle }, image: { $0.icon },
+                               watched: { session.isWatched(movie: $0.name) })
                 }
             }
             .padding(.vertical)
@@ -476,7 +479,8 @@ struct VodGrid: View {
                 ForEach(items) { v in
                     NavigationLink(value: v) {
                         PosterCell(title: v.name.cleanTitle, image: v.icon,
-                                   progress: session.resumeFor(movie: v.name).map { Double($0.pro) / 100 })
+                                   progress: session.resumeFor(movie: v.name).map { Double($0.pro) / 100 },
+                                   watched: session.isWatched(movie: v.name))
                     }
                     .buttonStyle(.plain)
                 }
@@ -508,6 +512,18 @@ struct MovieDetailView: View {
                         if let d = info?.duration, !d.isEmpty { Label(d, systemImage: "clock").font(.subheadline).foregroundStyle(.secondary) }
                         if let r = movie.rating, let v = Double(r), v > 0 {
                             Label(String(format: "%.1f", v), systemImage: "star.fill").font(.subheadline).foregroundStyle(.yellow)
+                        }
+                        if session.resumeEnabled {
+                            let seen = session.isWatched(movie: movie.name)
+                            Button {
+                                session.setWatched(type: "movie", name: movie.name, on: !seen)
+                            } label: {
+                                Label(seen ? "Vista" : "Marcar como vista", systemImage: seen ? "checkmark.circle.fill" : "checkmark.circle")
+                                    .font(.subheadline)
+                                    .foregroundStyle(seen ? Color.green : Color.accentColor)
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.top, 4)
                         }
                     }
                 }
@@ -729,8 +745,16 @@ struct SeriesDetailView: View {
                 .listRowBackground(Color.clear)
 
                 if let r = session.resumeFor(series: series.name), let ep = episode(season: r.season, number: r.episode) {
-                    Button { play(ep, from: r.position) } label: {
+                    Button { play(ep, from: r.position, season: r.season) } label: {
                         Label("Continuar T\(r.season) · E\(r.episode) (\(timeText(r.position)))", systemImage: "play.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .listRowBackground(Color.clear)
+                } else if let next = nextEpisode {
+                    // Lo siguiente a lo último que se terminó (para no perderse en la serie).
+                    Button { play(next.1, from: 0, season: next.0) } label: {
+                        Label("Siguiente: T\(next.0) · E\(next.1.number)", systemImage: "forward.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
@@ -741,12 +765,31 @@ struct SeriesDetailView: View {
             if let info, !info.seasons.isEmpty {
                 Section {
                     ForEach(info.episodes[season] ?? []) { ep in
-                        Button { play(ep, from: resumeMs(for: ep)) } label: { EpisodeRow(episode: ep, progress: progress(for: ep)) }
+                        let seen = isWatched(ep)
+                        Button { play(ep, from: resumeMs(for: ep)) } label: {
+                            EpisodeRow(episode: ep, progress: progress(for: ep), watched: seen)
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button { toggleWatched(ep) } label: {
+                                Label(seen ? "No visto" : "Visto", systemImage: seen ? "eye.slash" : "checkmark")
+                            }
+                            .tint(seen ? .gray : .green)
+                        }
+                        .contextMenu {
+                            Button { toggleWatched(ep) } label: {
+                                Label(seen ? "Marcar como no visto" : "Marcar como visto", systemImage: seen ? "eye.slash" : "checkmark.circle")
+                            }
+                            Button { markSeasonUpTo(ep) } label: {
+                                Label("Marcar vistos hasta aquí", systemImage: "checkmark.circle.badge.questionmark")
+                            }
+                        }
                     }
                 } header: {
                     if info.seasons.count > 1 {
                         Picker("Temporada", selection: $season) {
-                            ForEach(info.seasons, id: \.self) { Text("Temporada \($0)").tag($0) }
+                            ForEach(info.seasons, id: \.self) { n in
+                                Text(seasonDone(n) ? "Temporada \(n) ✓" : "Temporada \(n)").tag(n)
+                            }
                         }
                         .pickerStyle(.menu)
                     } else {
@@ -770,9 +813,10 @@ struct SeriesDetailView: View {
         guard info == nil, let api = session.api else { return }
         do {
             let i = try await api.seriesInfo(series.id)
-            let resumeSeason = session.resumeFor(series: series.name)?.season ?? 0
-            season = i.seasons.contains(resumeSeason) ? resumeSeason : (i.seasons.first ?? 0)
             info = i
+            // Temporada inicial: la de lo que está a medias; si no, la del siguiente capítulo por ver.
+            let resumeSeason = session.resumeFor(series: series.name)?.season ?? nextEpisode?.0 ?? 0
+            season = i.seasons.contains(resumeSeason) ? resumeSeason : (i.seasons.first ?? 0)
         } catch {
             self.error = error.localizedDescription
         }
@@ -791,9 +835,40 @@ struct SeriesDetailView: View {
     private func resumeMs(for ep: Episode) -> Int { isResume(ep)?.position ?? 0 }
     private func progress(for ep: Episode) -> Double? { isResume(ep).map { Double($0.pro) / 100 } }
 
-    private func play(_ ep: Episode, from ms: Int) {
+    /// Temporada real de un capítulo (algunos proveedores no la ponen en el capítulo).
+    private func seasonOf(_ ep: Episode) -> Int { ep.season > 0 ? ep.season : season }
+
+    private func isWatched(_ ep: Episode, season s: Int? = nil) -> Bool {
+        session.isWatched(series: series.name, season: s ?? seasonOf(ep), episode: ep.number)
+    }
+
+    private func toggleWatched(_ ep: Episode) {
+        session.setWatched(type: "series", name: series.name, season: seasonOf(ep), episode: ep.number, on: !isWatched(ep))
+    }
+
+    /// Marca como vistos todos los capítulos de la temporada hasta este (incluido).
+    private func markSeasonUpTo(_ ep: Episode) {
+        for e in info?.episodes[season] ?? [] where e.number <= ep.number && !isWatched(e) {
+            session.setWatched(type: "series", name: series.name, season: seasonOf(e), episode: e.number, on: true)
+        }
+    }
+
+    private func seasonDone(_ n: Int) -> Bool {
+        guard let eps = info?.episodes[n], !eps.isEmpty else { return false }
+        return eps.allSatisfy { isWatched($0, season: n) }
+    }
+
+    /// Capítulo siguiente al último terminado (en orden de temporadas).
+    private var nextEpisode: (Int, Episode)? {
+        guard let info else { return nil }
+        let all: [(Int, Episode)] = info.seasons.flatMap { n in (info.episodes[n] ?? []).map { (n, $0) } }
+        guard let last = all.lastIndex(where: { isWatched($0.1, season: $0.0) }), last + 1 < all.count else { return nil }
+        return all[last + 1]
+    }
+
+    private func play(_ ep: Episode, from ms: Int, season forced: Int? = nil) {
         guard let api = session.api else { return }
-        let s = ep.season > 0 ? ep.season : season
+        let s = forced ?? seasonOf(ep)
         playing = PlayItem(url: api.episodeURL(ep), title: series.name.cleanTitle,
                            subtitle: "T\(s) · E\(ep.number) · \(ep.title.cleanTitle)", startMs: ms,
                            resume: ResumeTarget(type: "series", name: series.name, itemId: ep.id, season: s, episode: ep.number))
@@ -803,15 +878,22 @@ struct SeriesDetailView: View {
 struct EpisodeRow: View {
     let episode: Episode
     let progress: Double?
+    var watched = false
 
     var body: some View {
         HStack(spacing: 12) {
-            Text("\(episode.number)")
-                .font(.headline.monospacedDigit())
-                .frame(width: 34)
-                .foregroundStyle(Color.accentColor)
+            Group {
+                if watched {
+                    Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(.green)
+                } else {
+                    Text("\(episode.number)").font(.headline.monospacedDigit()).foregroundStyle(Color.accentColor)
+                }
+            }
+            .frame(width: 34)
             VStack(alignment: .leading, spacing: 4) {
-                Text(episode.title.cleanTitle).lineLimit(2).foregroundStyle(.primary)
+                Text(watched ? "\(episode.number). \(episode.title.cleanTitle)" : episode.title.cleanTitle)
+                    .lineLimit(2)
+                    .foregroundStyle(watched ? Color.secondary : Color.primary)
                 if let d = episode.durationSecs, d > 0 {
                     Text("\(d / 60) min").font(.caption).foregroundStyle(.secondary)
                 }
@@ -829,6 +911,8 @@ struct EpisodeRow: View {
 struct ContinueView: View {
     @EnvironmentObject private var session: Session
     @State private var allSeries: [SeriesItem] = []
+    /// Carátula de cada peli por nombre (de la lista de pelis, que está en caché).
+    @State private var movieIcons: [String: String] = [:]
     @State private var playing: PlayItem?
 
     var body: some View {
@@ -853,22 +937,29 @@ struct ContinueView: View {
         .task {
             await session.refreshResume()
             if allSeries.isEmpty { allSeries = (try? await session.api?.series()) ?? [] }
+            if movieIcons.isEmpty, let movies = try? await session.api?.vodStreams() {
+                var d: [String: String] = [:]
+                for m in movies { if let i = m.icon, d[m.name] == nil { d[m.name] = i } }
+                movieIcons = d
+            }
         }
         .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
     }
 
     @ViewBuilder
     private func row(_ item: ResumeItem) -> some View {
-        if item.type == "series", let s = findSeries(item.name) {
-            NavigationLink(value: s) { ResumeRow(item: item) }
+        let series = item.type == "series" ? findSeries(item.name) : nil
+        let image = series?.cover ?? (item.type == "movie" ? movieIcons[item.name] : nil)
+        if let s = series {
+            NavigationLink(value: s) { ResumeRow(item: item, image: image) }
         } else if !item.url.isEmpty, let url = URL(string: item.url) {
             Button {
                 playing = PlayItem(url: url, title: item.name.cleanTitle, startMs: item.position,
                                    resume: ResumeTarget(type: item.type, name: item.name, itemId: item.itemId,
                                                         season: item.season, episode: item.episode))
-            } label: { ResumeRow(item: item) }
+            } label: { ResumeRow(item: item, image: image) }
         } else {
-            ResumeRow(item: item)
+            ResumeRow(item: item, image: image)
         }
     }
 
@@ -880,13 +971,23 @@ struct ContinueView: View {
 
 struct ResumeRow: View {
     let item: ResumeItem
+    var image: String? = nil
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: item.type == "series" ? "rectangle.stack.badge.play" : "film")
-                .font(.title2)
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 36)
+        HStack(spacing: 14) {
+            Color.clear
+                .frame(width: 64, height: 96)
+                .overlay {
+                    if image != nil {
+                        RemoteImage(url: image)
+                    } else {
+                        Image(systemName: item.type == "series" ? "rectangle.stack.badge.play" : "film")
+                            .font(.title2)
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                .background(Color.white.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 5) {
                 Text(item.name.seriesBaseName.cleanTitle).lineLimit(2).foregroundStyle(.primary)
                 Text(item.type == "series" ? "T\(item.season) · E\(item.episode)" : "Película")

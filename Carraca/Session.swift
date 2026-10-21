@@ -127,6 +127,65 @@ final class Session: ObservableObject {
         UserDefaults.standard.set(Array(favorites), forKey: favoritesKey)
     }
 
+    // MARK: Visto (pelis y capítulos terminados)
+
+    /// Claves "movie|nombre" y "series|serie|temporada|capítulo" (mismo formato que resume.php).
+    @Published private(set) var watched: Set<String> = []
+
+    static func watchKey(movie name: String) -> String {
+        "movie|" + name.trimmingCharacters(in: .whitespaces).lowercased()
+    }
+
+    static func watchKey(series name: String, season: Int, episode: Int) -> String {
+        let full = name.trimmingCharacters(in: .whitespaces).lowercased()
+        let base = full.seriesBaseNameAnyCase.trimmingCharacters(in: .whitespaces)
+        return "series|\(base.isEmpty ? full : base)|\(season)|\(episode)"
+    }
+
+    func isWatched(movie name: String) -> Bool { watched.contains(Session.watchKey(movie: name)) }
+
+    func isWatched(series name: String, season: Int, episode: Int) -> Bool {
+        watched.contains(Session.watchKey(series: name, season: season, episode: episode))
+    }
+
+    /// Marcar / desmarcar a mano.
+    func setWatched(type: String, name: String, season: Int = 0, episode: Int = 0, on: Bool) {
+        let key = type == "series" ? Session.watchKey(series: name, season: season, episode: episode) : Session.watchKey(movie: name)
+        if on { watched.insert(key) } else { watched.remove(key) }
+        guard let user = creds?.user else { return }
+        if remoteResume {
+            let body: [String: Any] = ["user": user, "action": "visto", "on": on, "type": type, "name": name,
+                                       "season": season, "episode": episode]
+            var req = URLRequest(url: AppConfig.resumeURL)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            URLSession.shared.dataTask(with: req).resume()
+        } else {
+            saveLocalWatched()
+        }
+    }
+
+    private var watchedDefaultsKey: String { "carraca.visto." + favoritesKey }
+
+    private func saveLocalWatched() {
+        UserDefaults.standard.set(Array(watched), forKey: watchedDefaultsKey)
+    }
+
+    private func refreshWatched() async {
+        guard resumeEnabled, let user = creds?.user else { watched = []; return }
+        if !remoteResume {
+            watched = Set(UserDefaults.standard.stringArray(forKey: watchedDefaultsKey) ?? [])
+            return
+        }
+        var comps = URLComponents(url: AppConfig.resumeURL, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "user", value: user), URLQueryItem(name: "visto", value: "1")]
+        guard let url = comps.url,
+              let res = try? await URLSession.shared.data(from: url),
+              let keys = try? JSONDecoder().decode([String].self, from: res.0) else { return }
+        watched = Set(keys)
+    }
+
     /// Último servidor usado (para rellenar el login si se cierra sesión).
     static let lastServerKey = "carraca.lastServer"
 
@@ -235,11 +294,13 @@ final class Session: ObservableObject {
         api = nil
         account = nil
         resume = []
+        watched = []
     }
 
     // MARK: Seguir viendo
 
     func refreshResume() async {
+        await refreshWatched()
         guard resumeEnabled, let user = creds?.user else { resume = []; return }
         if !remoteResume {
             resume = LocalResume.load()
@@ -266,6 +327,14 @@ final class Session: ObservableObject {
         guard resumeEnabled, let r = item.resume, let user = creds?.user,
               lengthMs > 60_000, timeMs > 10_000 else { return }
         let pro = min(100, max(0, Int(Double(timeMs) / Double(lengthMs) * 100)))
+        if pro >= 95 {
+            let key = r.type == "series" ? Session.watchKey(series: r.name, season: r.season, episode: r.episode)
+                                         : Session.watchKey(movie: r.name)
+            if !watched.contains(key) {
+                watched.insert(key)
+                if !remoteResume { saveLocalWatched() }   // en el panel lo apunta resume.php
+            }
+        }
 
         if !remoteResume {
             LocalResume.upsert(ResumeItem(type: r.type, name: r.name, itemId: r.itemId, url: item.url.absoluteString,

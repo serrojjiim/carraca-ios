@@ -42,7 +42,7 @@ struct RootView: View {
                 LoginView()
             } else if !store.checked {
                 LoadingView()
-            } else if store.isPremium {
+            } else if store.isPremium || store.testFlightBypass {
                 MainTabView()
             } else {
                 PaywallView()
@@ -346,6 +346,7 @@ struct PosterCell: View {
     let title: String
     let image: String?
     var progress: Double? = nil
+    var watched = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -356,6 +357,9 @@ struct PosterCell: View {
                     if let progress {
                         ProgressView(value: progress).tint(.accentColor).padding(6)
                     }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if watched { WatchedBadge().padding(5) }
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             Text(title)
@@ -407,6 +411,17 @@ struct ErrorView: View {
 
 let posterColumns = [GridItem(.adaptive(minimum: 108, maximum: 170), spacing: 12)]
 
+/// Marca de "ya visto" sobre una carátula.
+struct WatchedBadge: View {
+    var body: some View {
+        Image(systemName: "checkmark")
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(.white)
+            .padding(5)
+            .background(Circle().fill(Color.green))
+    }
+}
+
 /// Etiqueta pequeña (RAW, 4K, 60FPS…) sacada del nombre de la categoría.
 struct TagChip: View {
     let text: String
@@ -433,10 +448,13 @@ struct PosterRail<T: Identifiable & Hashable>: View {
     let titleOf: (T) -> String
     let imageOf: (T) -> String?
     let progressOf: (T) -> Double?
+    let watchedOf: (T) -> Bool
 
     init(_ title: String, tag: String? = nil, seeAll: Category? = nil, count: Int = 0, items: [T], width: CGFloat,
          title titleOf: @escaping (T) -> String, image imageOf: @escaping (T) -> String?,
-         progress progressOf: @escaping (T) -> Double? = { _ in nil }) {
+         progress progressOf: @escaping (T) -> Double? = { _ in nil },
+         watched watchedOf: @escaping (T) -> Bool = { _ in false }) {
+        self.watchedOf = watchedOf
         self.title = title
         self.tag = tag
         self.seeAll = seeAll
@@ -470,7 +488,7 @@ struct PosterRail<T: Identifiable & Hashable>: View {
                 LazyHStack(alignment: .top, spacing: 12) {
                     ForEach(items) { it in
                         NavigationLink(value: it) {
-                            PosterCell(title: titleOf(it), image: imageOf(it), progress: progressOf(it))
+                            PosterCell(title: titleOf(it), image: imageOf(it), progress: progressOf(it), watched: watchedOf(it))
                                 .frame(width: width)
                         }
                         .buttonStyle(.plain)

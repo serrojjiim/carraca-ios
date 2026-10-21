@@ -130,6 +130,14 @@ extension String {
         return self
     }
 
+    /// Como seriesBaseName pero sin distinguir mayúsculas ("s01e20" también vale).
+    var seriesBaseNameAnyCase: String {
+        if let r = range(of: #"\s*-?\s*[Ss]\d{1,2}\s*[Ee]\d{1,3}.*$"#, options: .regularExpression) {
+            return String(self[..<r.lowerBound])
+        }
+        return self
+    }
+
     /// "ES| CABEL TV SPORTS ᴿᴬᵂ" -> nombre "Cabel TV Sports" + etiqueta "RAW".
     var categoryLabel: CategoryLabel {
         var s = self

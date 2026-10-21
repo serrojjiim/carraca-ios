@@ -20,6 +20,13 @@ final class Store: ObservableObject {
 
     private var updates: Task<Void, Never>?
 
+    /// Build de TestFlight (recibo de sandbox).
+    static let isTestFlight = Bundle.main.appStoreReceiptURL?.lastPathComponent == "sandboxReceipt"
+
+    /// Solo TestFlight y solo mientras los planes no existen en App Store Connect:
+    /// deja entrar para poder probar el resto de la app. En la App Store nunca aplica.
+    var testFlightBypass: Bool { Store.isTestFlight && products.isEmpty && loadFailed }
+
     init() {
         if Flavor.isPrivate {
             isPremium = true
