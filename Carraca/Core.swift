@@ -138,6 +138,31 @@ extension String {
         return self
     }
 
+    /// "TF: GH 24H 1 + ᴿᴬᵂ" -> nombre "GH 24H 1 +" + etiqueta "RAW" (sin cambiar mayúsculas).
+    var channelLabel: CategoryLabel {
+        var s = self
+        if let r = s.range(of: #"^[A-Z0-9]{1,8}\s*:\s+"#, options: .regularExpression) {
+            s = String(s[r.upperBound...])
+        }
+        let parts = s.splitSuperscriptTags
+        return CategoryLabel(name: parts.0.isEmpty ? self : parts.0, tag: parts.1)
+    }
+
+    /// Palabras normales por un lado y las de letras pequeñitas (etiquetas) por otro.
+    private var splitSuperscriptTags: (String, String?) {
+        var words: [String] = []
+        var tags: [String] = []
+        for token in split(separator: " ") {
+            let sup = token.filter { superscriptLetters[$0] != nil }.count
+            if sup > 0 && sup * 2 >= token.count {
+                tags.append(token.map { c in superscriptLetters[c].map { String($0) } ?? c.uppercased() }.joined())
+            } else {
+                words.append(String(token))
+            }
+        }
+        return (words.joined(separator: " "), tags.isEmpty ? nil : tags.joined(separator: " "))
+    }
+
     /// "ES| CABEL TV SPORTS ᴿᴬᵂ" -> nombre "Cabel TV Sports" + etiqueta "RAW".
     var categoryLabel: CategoryLabel {
         var s = self
@@ -207,6 +232,9 @@ struct LiveStream: Decodable, Identifiable, Hashable {
     let categoryId: String
     /// Solo en listas M3U: URL directa del canal.
     var directURL: URL? = nil
+
+    /// "Canales" que solo hacen de título de sección ("#### TELEFÓNICA ####", con bandera de icono).
+    var isSeparator: Bool { name.range(of: #"#{3,}|={4,}|-{5,}|\*{4,}"#, options: .regularExpression) != nil }
 
     init(id: Int, name: String, icon: String?, categoryId: String, directURL: URL?) {
         self.id = id

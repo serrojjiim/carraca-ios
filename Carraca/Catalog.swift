@@ -16,8 +16,84 @@ struct LiveView: View {
     @State private var playing: PlayItem?
     /// Categorías en tarjetas (por defecto) o en lista; se recuerda en el dispositivo.
     @AppStorage("carraca.live.asList") private var asList = false
+    @Environment(\.horizontalSizeClass) private var hsize
+    /// iPad: categoría elegida en la columna de la izquierda.
+    @State private var selected: Category?
 
     var body: some View {
+        Group {
+            if hsize == .regular { splitBody } else { stackBody }
+        }
+        .task { if streams.isEmpty { await load() } }
+        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
+        .fullScreenCover(item: $playing) { PlayerView(item: $0) }
+    }
+
+    /// iPad: categorías a la izquierda; canales (con vista previa) a la derecha.
+    private var splitBody: some View {
+        NavigationSplitView {
+            Group {
+                if streams.isEmpty && loading {
+                    LoadingView()
+                } else if streams.isEmpty, let error {
+                    ErrorView(message: error) { Task { await load(force: true) } }
+                } else {
+                    sidebar
+                }
+            }
+            .navigationTitle("Directo")
+            .searchable(text: $query, placement: .sidebar, prompt: "Buscar canal")
+            .withSettings()
+        } detail: {
+            NavigationStack {
+                if !query.isEmpty {
+                    results.navigationTitle("Resultados")
+                } else if let cat = selected {
+                    ChannelListView(title: title(of: cat), channels: channels(in: cat), makeItem: makeItem)
+                        .id(cat.id)
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "sidebar.left").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("Elige una categoría").foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .navigationSplitViewStyle(.balanced)
+        .onChange(of: categories) { cats in
+            if selected == nil { selected = cats.first }
+        }
+    }
+
+    private var sidebar: some View {
+        let favs = channels(in: Category.favorites)
+        return List(selection: $selected) {
+            if !favs.isEmpty {
+                CategoryListRow(name: "Favoritos", tag: nil, count: favs.count, logo: favs.first?.icon, symbol: "star.fill")
+                    .tag(Category.favorites)
+            }
+            CategoryListRow(name: "Todos los canales", tag: nil, count: streams.count, logo: nil, symbol: "square.grid.2x2")
+                .tag(Category.all)
+            ForEach(categories) { c in
+                let l = c.name.categoryLabel
+                CategoryListRow(name: l.name, tag: l.tag, count: counts[c.id] ?? 0, logo: logos[c.id]?.first)
+                    .tag(c)
+            }
+        }
+        .listStyle(.sidebar)
+        .refreshable { await load(force: true) }
+    }
+
+    private func title(of cat: Category) -> String {
+        switch cat.id {
+        case Category.all.id: return "Todos los canales"
+        case Category.favorites.id: return "Favoritos"
+        default: return cat.name.categoryLabel.name
+        }
+    }
+
+    /// iPhone: tarjetas o lista de categorías y, al tocar, la lista de canales.
+    private var stackBody: some View {
         NavigationStack {
             Group {
                 if streams.isEmpty && loading {
@@ -45,13 +121,10 @@ struct LiveView: View {
             }
             .searchable(text: $query, prompt: "Buscar canal")
             .navigationDestination(for: Category.self) { cat in
-                ChannelListView(title: cat.name.categoryLabel.name, channels: channels(in: cat), makeItem: makeItem)
+                ChannelListView(title: title(of: cat), channels: channels(in: cat), makeItem: makeItem)
             }
             .withSettings()
         }
-        .task { if streams.isEmpty { await load() } }
-        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
-        .fullScreenCover(item: $playing) { PlayerView(item: $0) }
     }
 
     private var grid: some View {
@@ -129,20 +202,21 @@ struct LiveView: View {
         defer { loading = false }
         do {
             var cats: [Category]
-            let all: [LiveStream]
+            let loaded: [LiveStream]
             if session.isM3U {
                 // En M3U las categorías salen de group-title, en el orden de la lista.
-                all = try await session.m3uChannels(force: force)
+                loaded = try await session.m3uChannels(force: force)
                 var seen = Set<String>()
                 cats = []
-                for s in all where seen.insert(s.categoryId).inserted {
+                for s in loaded where seen.insert(s.categoryId).inserted {
                     cats.append(Category(id: s.categoryId, name: s.categoryId))
                 }
             } else {
                 guard let api = session.api else { return }
                 cats = try await api.liveCategories(force: force)
-                all = try await api.liveStreams(force: force)
+                loaded = try await api.liveStreams(force: force)
             }
+            let all = loaded.filter { !$0.isSeparator }
             var cnt: [String: Int] = [:]
             var lg: [String: [String]] = [:]
             for s in all {
@@ -164,7 +238,7 @@ struct LiveView: View {
         let api = session.api
         let urlFor: (LiveStream) -> URL? = { c in c.directURL ?? api?.liveURL(c.id) }
         guard let url = urlFor(s) else { return nil }
-        var item = PlayItem(url: url, title: s.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
+        var item = PlayItem(url: url, title: s.name.channelLabel.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
         let playable = list.filter { urlFor($0) != nil }
         item.channels = playable
         item.channelIndex = playable.firstIndex(of: s) ?? 0
@@ -210,7 +284,9 @@ struct ChannelListView: View {
                         .frame(width: 60, height: 40)
                         .background(Color.white.opacity(0.04))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
-                    Text(s.name).lineLimit(1).foregroundStyle(.primary)
+                    let l = s.name.channelLabel
+                    Text(l.name).lineLimit(1).foregroundStyle(.primary)
+                    if let t = l.tag { TagChip(text: t) }
                     if session.isFavorite(s) {
                         Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
                     }
@@ -281,7 +357,7 @@ struct ChannelListView: View {
                 }
                 .frame(maxWidth: 560)
 
-                Text(s.name).font(.headline).lineLimit(1)
+                Text(s.name.channelLabel.name).font(.headline).lineLimit(1)
                 if let now = epg.first {
                     Text("Ahora: \(now.title)\(range(now))").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 }
@@ -389,7 +465,9 @@ struct ChannelRow: View {
                 .frame(width: 60, height: 40)
                 .background(Color.white.opacity(0.04))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
-            Text(stream.name).lineLimit(1).foregroundStyle(.primary)
+            let l = stream.name.channelLabel
+            Text(l.name).lineLimit(1).foregroundStyle(.primary)
+            if let t = l.tag { TagChip(text: t) }
             if session.isFavorite(stream) {
                 Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
             }

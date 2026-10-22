@@ -293,7 +293,7 @@ struct PlayerView: View {
         guard let i = channelIndex, item.channels.indices.contains(i) else { return nil }
         return item.channels[i]
     }
-    private var title: String { currentChannel?.name ?? item.title }
+    private var title: String { currentChannel?.name.channelLabel.name ?? item.title }
     private var canZap: Bool { item.isLive && item.channels.count > 1 && item.channelURL != nil }
 
     var body: some View {
