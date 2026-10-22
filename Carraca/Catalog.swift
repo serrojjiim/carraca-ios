@@ -435,6 +435,7 @@ struct ChannelListView: View {
 }
 
 extension Category {
+    static let home = Category(id: "__inicio__", name: "Inicio")
     static let favorites = Category(id: "__favoritos__", name: "Favoritos")
 }
 
@@ -505,26 +506,12 @@ struct MoviesView: View {
     @State private var error: String?
     @State private var query = ""
 
+    /// iPad: categoría elegida en el menú lateral (Inicio = filas de carátulas).
+    @State private var selected: Category? = Category.home
+
     var body: some View {
-        NavigationStack {
-            Group {
-                if movies.isEmpty && loading {
-                    LoadingView()
-                } else if movies.isEmpty, let error {
-                    ErrorView(message: error) { Task { await load(force: true) } }
-                } else if !query.isEmpty {
-                    VodGrid(items: Array(movies.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
-                } else {
-                    home
-                }
-            }
-            .navigationTitle("Películas")
-            .searchable(text: $query, prompt: "Buscar película")
-            .navigationDestination(for: Category.self) { cat in
-                VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
-            }
-            .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
-            .withSettings()
+        Group {
+            if hsize == .regular { splitBody } else { stackBody }
         }
         .task { if movies.isEmpty { await load() } }
         .onChange(of: session.reloadToken) { _ in
@@ -535,6 +522,60 @@ struct MoviesView: View {
             }
         }
         .overlay { if reloading { ReloadingOverlay() } }
+    }
+
+    /// Lo de dentro: cargando / error / búsqueda / Inicio.
+    @ViewBuilder
+    private var main: some View {
+        if movies.isEmpty && loading {
+            LoadingView()
+        } else if movies.isEmpty, let error {
+            ErrorView(message: error) { Task { await load(force: true) } }
+        } else if !query.isEmpty {
+            VodGrid(items: Array(movies.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
+        } else {
+            home
+        }
+    }
+
+    /// iPhone: como siempre.
+    private var stackBody: some View {
+        NavigationStack {
+            main
+                .navigationTitle("Películas")
+                .searchable(text: $query, prompt: "Buscar película")
+                .navigationDestination(for: Category.self) { cat in
+                    VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                }
+                .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
+                .withSettings()
+        }
+    }
+
+    /// iPad: menú lateral con las categorías para saltar de una a otra.
+    private var splitBody: some View {
+        NavigationSplitView {
+            VodSidebar(categories: categories, counts: counts, selection: $selected)
+                .navigationTitle("Películas")
+                .searchable(text: $query, placement: .sidebar, prompt: "Buscar película")
+                .withSettings()
+        } detail: {
+            NavigationStack {
+                Group {
+                    if query.isEmpty, let cat = selected, cat != Category.home {
+                        VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                    } else {
+                        main.navigationTitle(query.isEmpty ? "Inicio" : "Resultados")
+                    }
+                }
+                .navigationDestination(for: Category.self) { cat in
+                    VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                }
+                .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
+            }
+            .id(selected?.id)
+        }
+        .navigationSplitViewStyle(.balanced)
     }
 
     private var home: some View {
@@ -721,26 +762,12 @@ struct SeriesView: View {
     @State private var error: String?
     @State private var query = ""
 
+    /// iPad: categoría elegida en el menú lateral (Inicio = filas de carátulas).
+    @State private var selected: Category? = Category.home
+
     var body: some View {
-        NavigationStack {
-            Group {
-                if items.isEmpty && loading {
-                    LoadingView()
-                } else if items.isEmpty, let error {
-                    ErrorView(message: error) { Task { await load(force: true) } }
-                } else if !query.isEmpty {
-                    SeriesGrid(items: Array(items.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
-                } else {
-                    home
-                }
-            }
-            .navigationTitle("Series")
-            .searchable(text: $query, prompt: "Buscar serie")
-            .navigationDestination(for: Category.self) { cat in
-                SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
-            }
-            .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
-            .withSettings()
+        Group {
+            if hsize == .regular { splitBody } else { stackBody }
         }
         .task { if items.isEmpty { await load() } }
         .onChange(of: session.reloadToken) { _ in
@@ -751,6 +778,60 @@ struct SeriesView: View {
             }
         }
         .overlay { if reloading { ReloadingOverlay() } }
+    }
+
+    /// Lo de dentro: cargando / error / búsqueda / Inicio.
+    @ViewBuilder
+    private var main: some View {
+        if items.isEmpty && loading {
+            LoadingView()
+        } else if items.isEmpty, let error {
+            ErrorView(message: error) { Task { await load(force: true) } }
+        } else if !query.isEmpty {
+            SeriesGrid(items: Array(items.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
+        } else {
+            home
+        }
+    }
+
+    /// iPhone: como siempre.
+    private var stackBody: some View {
+        NavigationStack {
+            main
+                .navigationTitle("Series")
+                .searchable(text: $query, prompt: "Buscar serie")
+                .navigationDestination(for: Category.self) { cat in
+                    SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                }
+                .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
+                .withSettings()
+        }
+    }
+
+    /// iPad: menú lateral con las categorías para saltar de una a otra.
+    private var splitBody: some View {
+        NavigationSplitView {
+            VodSidebar(categories: categories, counts: counts, selection: $selected)
+                .navigationTitle("Series")
+                .searchable(text: $query, placement: .sidebar, prompt: "Buscar serie")
+                .withSettings()
+        } detail: {
+            NavigationStack {
+                Group {
+                    if query.isEmpty, let cat = selected, cat != Category.home {
+                        SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                    } else {
+                        main.navigationTitle(query.isEmpty ? "Inicio" : "Resultados")
+                    }
+                }
+                .navigationDestination(for: Category.self) { cat in
+                    SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                }
+                .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
+            }
+            .id(selected?.id)
+        }
+        .navigationSplitViewStyle(.balanced)
     }
 
     private var home: some View {
