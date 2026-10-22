@@ -9,6 +9,11 @@ final class Store: ObservableObject {
     static let productIDs = ["com.carraca.smarter.premium.mensual", "com.carraca.smarter.premium.anual"]
     static let eulaURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
 
+    /// Interruptor de la suscripción. En false la app es gratis para todos: no se pide pago, no se
+    /// consulta StoreKit y Ajustes no enseña "Suscripción". Para activarla en el futuro: true +
+    /// productos creados en App Store Connect (acuerdo de apps de pago firmado) + enviarlos con la versión.
+    static let paywallEnabled = false
+
     @Published private(set) var products: [Product] = []
     @Published private(set) var isPremium = false
     /// Hasta comprobar las compras no se enseña ni la app ni la pantalla de pago.
@@ -28,7 +33,7 @@ final class Store: ObservableObject {
     var testFlightBypass: Bool { Store.isTestFlight && products.isEmpty && loadFailed }
 
     init() {
-        if Flavor.isPrivate {
+        if Flavor.isPrivate || !Store.paywallEnabled {
             isPremium = true
             checked = true
             return

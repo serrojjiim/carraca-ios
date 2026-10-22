@@ -292,7 +292,7 @@ struct SettingsView: View {
                         Text("\"Seguir viendo\" se sincroniza con el servidor de tu cuenta: lo que empiezas en la tele lo continúas aquí.")
                     }
                 }
-                if !Flavor.isPrivate {
+                if !Flavor.isPrivate && Store.paywallEnabled {
                     Section("Suscripción") {
                         LabeledContent("Carraca Premium", value: store.isPremium ? "Activa" : "No activa")
                         if let e = store.expiration {
