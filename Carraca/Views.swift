@@ -584,3 +584,29 @@ struct CategoryCard: View {
         .contentShape(RoundedRectangle(cornerRadius: 12))
     }
 }
+
+/// iPad: menú lateral de Películas / Series (Inicio + categorías con nº de títulos).
+struct VodSidebar: View {
+    let categories: [Category]
+    let counts: [String: Int]
+    @Binding var selection: Category?
+
+    var body: some View {
+        List(selection: $selection) {
+            Label("Inicio", systemImage: "house").tag(Category.home)
+            Section("Categorías") {
+                ForEach(categories) { c in
+                    let l = c.name.categoryLabel
+                    HStack(spacing: 6) {
+                        Text(l.name).lineLimit(1)
+                        if let t = l.tag { TagChip(text: t) }
+                        Spacer(minLength: 6)
+                        Text("\(counts[c.id] ?? 0)").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .tag(c)
+                }
+            }
+        }
+        .listStyle(.sidebar)
+    }
+}
