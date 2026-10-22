@@ -12,15 +12,18 @@ body{margin:0;font-family:-apple-system,system-ui,sans-serif;background:#0d0f16;
 input{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;border:1px solid #2a2f3c;background:#0d0f16;color:#eef1f6;font-size:16px;margin-bottom:10px}
 textarea{width:100%;box-sizing:border-box;height:90px;padding:10px;border-radius:10px;background:#0d0f16;color:#2eb8d1;border:1px solid #2a2f3c;font-size:13px}
 .note{font-size:13px;color:#7c8496}.hide{display:none}
+.ico{width:84px;height:84px;border-radius:19px;display:block;margin:0 0 14px}
 </style></head><body><div class="w">
 
 <!-- ===== Vista del AMIGO (el enlace trae #s=..&u=..&p=..) ===== -->
 <div id="amigo" class="hide">
+  <img src="icono.jpg" alt="" class="ico">
   <h1>Carraca</h1><p class="sub">Te han invitado a usar Carraca en tu iPhone o iPad</p>
   <div class="card">
     <h2><span class="num">1</span>Instala la app</h2>
-    <p>Se instala con <b>TestFlight</b>, la app oficial de Apple para probar apps. Pulsa el botón, instala TestFlight si te lo pide, y luego <b>Aceptar</b> e <b>Instalar</b>.</p>
-    <a class="btn" id="tf" href="#">Instalar Carraca</a>
+    <p>Está en la <b>App Store</b>: pulsa el botón y dale a <b>Obtener</b>. Si ya la tenías de la beta (TestFlight), al instalarla desde aquí se sustituye sola, sin perder nada.</p>
+    <a class="btn" id="tf" href="#">Descargar en la App Store</a>
+    <p class="note" style="margin:12px 0 0">¿Quieres probar las novedades antes que nadie? <a id="beta" href="#" style="color:#2eb8d1">Versión beta en TestFlight</a></p>
   </div>
   <div class="card hide" id="regalo">
     <h2><span class="num">2</span>Activa tu suscripción regalada</h2>
@@ -59,13 +62,16 @@ textarea{width:100%;box-sizing:border-box;height:90px;padding:10px;border-radius
 <script>
 // Enlace publico de TestFlight (se rellena cuando Apple apruebe la beta).
 var TESTFLIGHT = "https://testflight.apple.com/join/K6jKK3WV";
+// Ficha de la App Store (publicada el 22-10-2026).
+var APPSTORE = "https://apps.apple.com/es/app/carraca-player/id6824508555";
 // Id de Carraca Player en la App Store (para canjear códigos de regalo).
 var APP_ID = "6824508555";
 var q = new URLSearchParams(location.hash.slice(1));
 if (q.get("s") || q.get("m3u")) {
   document.getElementById("amigo").classList.remove("hide");
   var tf = document.getElementById("tf");
-  if (TESTFLIGHT) { tf.href = TESTFLIGHT; } else { tf.textContent = "Muy pronto"; tf.className = "btn sec"; }
+  tf.href = APPSTORE;
+  document.getElementById("beta").href = TESTFLIGHT;
   var a = new URLSearchParams();
   ["s","u","p","m3u"].forEach(function(k){ if (q.get(k)) a.set(k, q.get(k)); });
   document.getElementById("open").href = "carraca://login?" + a.toString();
