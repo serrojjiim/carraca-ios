@@ -499,6 +499,35 @@ struct PosterRail<T: Identifiable & Hashable>: View {
     }
 }
 
+/// Fila de categoría de directo (vista lista): logo del primer canal + nombre + nº de canales.
+struct CategoryListRow: View {
+    let name: String
+    let tag: String?
+    let count: Int
+    let logo: String?
+    var symbol: String? = nil
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Group {
+                if let symbol, logo == nil {
+                    Image(systemName: symbol).foregroundStyle(symbol == "star.fill" ? Color.yellow : Color.accentColor)
+                } else {
+                    RemoteImage(url: logo, contentMode: .fit).padding(3)
+                }
+            }
+            .frame(width: 52, height: 34)
+            .background(Color.white.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            Text(name).lineLimit(1)
+            if let tag { TagChip(text: tag) }
+            Spacer(minLength: 6)
+            Text("\(count)").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 /// Tarjeta de categoría de directo: logos de sus primeros canales + nombre + nº de canales.
 struct CategoryCard: View {
     let name: String

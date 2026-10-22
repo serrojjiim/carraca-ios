@@ -14,6 +14,8 @@ struct LiveView: View {
     @State private var error: String?
     @State private var query = ""
     @State private var playing: PlayItem?
+    /// Categorías en tarjetas (por defecto) o en lista; se recuerda en el dispositivo.
+    @AppStorage("carraca.live.asList") private var asList = false
 
     var body: some View {
         NavigationStack {
@@ -24,11 +26,23 @@ struct LiveView: View {
                     ErrorView(message: error) { Task { await load(force: true) } }
                 } else if !query.isEmpty {
                     results
+                } else if asList {
+                    categoryList
                 } else {
                     grid
                 }
             }
             .navigationTitle("Directo")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { asList.toggle() }
+                    } label: {
+                        Image(systemName: asList ? "square.grid.2x2" : "list.bullet")
+                    }
+                    .accessibilityLabel(asList ? "Ver en tarjetas" : "Ver en lista")
+                }
+            }
             .searchable(text: $query, prompt: "Buscar canal")
             .navigationDestination(for: Category.self) { cat in
                 ChannelListView(title: cat.name.categoryLabel.name, channels: channels(in: cat), makeItem: makeItem)
@@ -66,6 +80,29 @@ struct LiveView: View {
             }
             .padding()
         }
+        .refreshable { await load(force: true) }
+    }
+
+    /// Misma información que las tarjetas, en filas compactas (caben muchas más categorías).
+    private var categoryList: some View {
+        let favs = channels(in: Category.favorites)
+        return List {
+            if !favs.isEmpty {
+                NavigationLink(value: Category.favorites) {
+                    CategoryListRow(name: "Favoritos", tag: nil, count: favs.count, logo: favs.first?.icon, symbol: "star.fill")
+                }
+            }
+            NavigationLink(value: Category.all) {
+                CategoryListRow(name: "Todos los canales", tag: nil, count: streams.count, logo: nil, symbol: "square.grid.2x2")
+            }
+            ForEach(categories) { c in
+                let l = c.name.categoryLabel
+                NavigationLink(value: c) {
+                    CategoryListRow(name: l.name, tag: l.tag, count: counts[c.id] ?? 0, logo: logos[c.id]?.first)
+                }
+            }
+        }
+        .listStyle(.plain)
         .refreshable { await load(force: true) }
     }
 
