@@ -66,6 +66,8 @@ final class Session: ObservableObject {
     @Published var update: RemoteConfig?
     @Published var resume: [ResumeItem] = []
     @Published var prefill: LoginPrefill?
+    /// Sube al pulsar "Recargar listas": las pestañas lo vigilan y vuelven a descargar al momento.
+    @Published var reloadToken = 0
 
     var isLoggedIn: Bool { creds != nil }
     var isM3U: Bool { creds?.m3u != nil }

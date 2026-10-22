@@ -36,6 +36,7 @@ struct LiveView: View {
             .withSettings()
         }
         .task { if streams.isEmpty { await load() } }
+        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
     }
 
@@ -401,6 +402,7 @@ struct MoviesView: View {
             .withSettings()
         }
         .task { if movies.isEmpty { await load() } }
+        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
     }
 
     private var home: some View {
@@ -608,6 +610,7 @@ struct SeriesView: View {
             .withSettings()
         }
         .task { if items.isEmpty { await load() } }
+        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
     }
 
     private var home: some View {
