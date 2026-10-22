@@ -228,7 +228,6 @@ struct SettingsView: View {
     @EnvironmentObject private var session: Session
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
-    @State private var cleared = false
     @State private var manage = false
 
     var body: some View {
@@ -267,11 +266,11 @@ struct SettingsView: View {
                     }
                 }
                 Section {
-                    Button(cleared ? "Listas borradas: se recargan al entrar" : "Recargar listas de canales y películas") {
+                    Button("Recargar listas de canales y películas") {
                         DiskCache.clear()
-                        cleared = true
+                        session.reloadToken += 1
+                        dismiss()
                     }
-                    .disabled(cleared)
                 } footer: {
                     Text("Las listas se guardan 12 horas para que la app vaya rápida.")
                 }
