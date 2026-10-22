@@ -1,5 +1,35 @@
 import SwiftUI
 import AVFoundation
+import StoreKit
+
+/// Pedir valoración en la App Store "cada x tiempo".
+/// Se usa la ventanita oficial de Apple (obligatorio: no se permiten avisos propios). Apple además
+/// no la enseña a quien ya ha valorado la versión y como mucho 3 veces al año; en TestFlight nunca sale.
+enum ReviewPrompt {
+    private static let d = UserDefaults.standard
+    private static let firstKey = "carraca.review.first"
+    private static let launchesKey = "carraca.review.launches"
+    private static let lastKey = "carraca.review.last"
+
+    /// Cada cuántos días como mínimo se vuelve a pedir.
+    static let everyDays: Double = 30
+
+    static func countLaunch() {
+        if d.object(forKey: firstKey) == nil { d.set(Date(), forKey: firstKey) }
+        d.set(d.integer(forKey: launchesKey) + 1, forKey: launchesKey)
+    }
+
+    /// Tras unos usos (4 aperturas y 2 días desde la primera) y si hace más de `everyDays` de la última vez.
+    static var shouldAsk: Bool {
+        guard let first = d.object(forKey: firstKey) as? Date else { return false }
+        let day: Double = 86_400
+        guard d.integer(forKey: launchesKey) >= 4, Date().timeIntervalSince(first) >= 2 * day else { return false }
+        if let last = d.object(forKey: lastKey) as? Date, Date().timeIntervalSince(last) < everyDays * day { return false }
+        return true
+    }
+
+    static func markAsked() { d.set(Date(), forKey: lastKey) }
+}
 
 /// Controla qué orientaciones permite la app en cada momento (el reproductor fuerza horizontal en iPhone).
 final class AppDelegate: NSObject, UIApplicationDelegate {
@@ -18,6 +48,7 @@ struct CarracaApp: App {
     @StateObject private var store = Store()
 
     init() {
+        ReviewPrompt.countLaunch()
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         URLCache.shared = URLCache(memoryCapacity: 64 << 20, diskCapacity: 400 << 20)
     }
@@ -204,6 +235,7 @@ struct LoginView: View {
 
 struct MainTabView: View {
     @EnvironmentObject private var session: Session
+    @Environment(\.requestReview) private var requestReview
 
     var body: some View {
         TabView {
@@ -218,6 +250,13 @@ struct MainTabView: View {
             if session.showsEvents {
                 SportsView().tabItem { Label("Eventos", systemImage: "sportscourt") }
             }
+        }
+        .task {
+            // Al abrir (no en mitad de un vídeo): unos segundos después de entrar.
+            guard ReviewPrompt.shouldAsk else { return }
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            ReviewPrompt.markAsked()
+            requestReview()
         }
     }
 }
