@@ -393,6 +393,24 @@ struct LoadingView: View {
     }
 }
 
+/// Pantalla de "recargando" encima del contenido mientras se vuelven a descargar las listas.
+struct ReloadingOverlay: View {
+    var body: some View {
+        ZStack {
+            Color("LaunchBg").opacity(0.92).ignoresSafeArea()
+            VStack(spacing: 14) {
+                ProgressView().controlSize(.large)
+                Text("Recargando listas…").font(.headline)
+                Text("Descargando canales, películas y series de nuevo.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding()
+        }
+        .transition(.opacity)
+    }
+}
+
 struct ErrorView: View {
     let message: String
     let retry: () -> Void

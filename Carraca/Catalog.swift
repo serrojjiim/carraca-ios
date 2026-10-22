@@ -14,6 +14,8 @@ struct LiveView: View {
     @State private var error: String?
     @State private var query = ""
     @State private var playing: PlayItem?
+    /// "Recargar listas" de Ajustes en curso (pantalla de cargando encima).
+    @State private var reloading = false
     /// Categorías en tarjetas (por defecto) o en lista; se recuerda en el dispositivo.
     @AppStorage("carraca.live.asList") private var asList = false
     @Environment(\.horizontalSizeClass) private var hsize
@@ -25,7 +27,14 @@ struct LiveView: View {
             if hsize == .regular { splitBody } else { stackBody }
         }
         .task { if streams.isEmpty { await load() } }
-        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
+        .onChange(of: session.reloadToken) { _ in
+            Task {
+                reloading = true
+                await load(force: true)
+                reloading = false
+            }
+        }
+        .overlay { if reloading { ReloadingOverlay() } }
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
     }
 
@@ -491,6 +500,7 @@ struct MoviesView: View {
     @State private var byName: [String: VodStream] = [:]
     @State private var recent: [VodStream] = []
     @State private var top: [VodStream] = []
+    @State private var reloading = false
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
@@ -517,7 +527,14 @@ struct MoviesView: View {
             .withSettings()
         }
         .task { if movies.isEmpty { await load() } }
-        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
+        .onChange(of: session.reloadToken) { _ in
+            Task {
+                reloading = true
+                await load(force: true)
+                reloading = false
+            }
+        }
+        .overlay { if reloading { ReloadingOverlay() } }
     }
 
     private var home: some View {
@@ -699,6 +716,7 @@ struct SeriesView: View {
     @State private var byCategory: [String: [SeriesItem]] = [:]
     @State private var byName: [String: SeriesItem] = [:]
     @State private var recent: [SeriesItem] = []
+    @State private var reloading = false
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
@@ -725,7 +743,14 @@ struct SeriesView: View {
             .withSettings()
         }
         .task { if items.isEmpty { await load() } }
-        .onChange(of: session.reloadToken) { _ in Task { await load(force: true) } }
+        .onChange(of: session.reloadToken) { _ in
+            Task {
+                reloading = true
+                await load(force: true)
+                reloading = false
+            }
+        }
+        .overlay { if reloading { ReloadingOverlay() } }
     }
 
     private var home: some View {
