@@ -31,6 +31,10 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     /// Salto en curso: a dónde se ha pedido ir y cuándo (VLC tarda en confirmar la nueva posición).
     private var seekTarget: Int?
     private var seekStarted = Date.distantPast
+    /// Pistas a recuperar tras reabrir el vídeo en otro punto (nombres de audio y subtítulos).
+    private var restoreTracks: (audio: String?, text: String?)?
+    /// Al cambiar de vídeo VLC avisa "parado" del anterior: no es un corte.
+    private var ignoreStopUntil = Date.distantPast
 
     override init() {
         super.init()
@@ -46,6 +50,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         ended = false
         buffering = true
         seekTarget = nil
+        ignoreStopUntil = Date().addingTimeInterval(3)
         guard let media = VLCMedia(url: url) else { failed = true; return }
         media.addOption(":network-caching=\(live ? (muted ? 1500 : 2500) : 4000)")
         if muted { media.addOption(":no-audio") }
@@ -83,11 +88,36 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         let from = seekTarget ?? timeMs
         let offset = target - from
         guard offset != 0 else { return }
+        if abs(offset) > 60_000, !live, let url {
+            // Salto grande: VLC 4 no salta bien dentro de un archivo por internet (lo lee seguido
+            // hasta llegar o se queda parado). Reabrirlo ya en ese punto es casi inmediato.
+            let audio = player.audioTracks.first(where: { $0.isSelected })?.trackName
+            let text = player.textTracks.first(where: { $0.isSelected })?.trackName
+            let keepMuted = muted
+            start(url: url, startMs: target, live: false, muted: keepMuted)
+            restoreTracks = (audio, text)
+        } else {
+            _ = player.jump(withOffset: Int32(clamping: offset), completion: nil)
+        }
         seekTarget = target
         seekStarted = Date()
         timeMs = target
         buffering = true
-        _ = player.jump(withOffset: Int32(clamping: offset), completion: nil)
+    }
+
+    /// Tras reabrir: vuelve a poner el idioma y los subtítulos que había.
+    private func applyRestoredTracks() {
+        guard let r = restoreTracks else { return }
+        restoreTracks = nil
+        if let a = r.audio, let t = player.audioTracks.first(where: { $0.trackName == a }) {
+            t.isSelectedExclusively = true
+        }
+        if let name = r.text {
+            if let t = player.textTracks.first(where: { $0.trackName == name }) { t.isSelectedExclusively = true }
+        } else {
+            player.deselectAllTextTracks()
+        }
+        objectWillChange.send()
     }
 
     func stop() {
@@ -167,6 +197,10 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.buffering = false
                 self.playing = true
                 self.retries = 0
+                if self.restoreTracks != nil {
+                    // las pistas aparecen un instante después de empezar
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.applyRestoredTracks() }
+                }
                 self.pipController?.invalidatePlaybackState()
             case .paused:
                 self.playing = false
@@ -175,7 +209,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.handleError()
             case .stopped:
                 self.playing = false
-                guard !self.halted else { return }
+                guard !self.halted, Date() >= self.ignoreStopUntil else { return }
                 // VLC 4 no tiene estado "ended": si para solo, o ha llegado al final o se ha cortado.
                 if !self.live, self.lengthMs > 0, self.timeMs >= self.lengthMs - 5000 {
                     self.ended = true
