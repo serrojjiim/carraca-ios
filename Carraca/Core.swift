@@ -412,9 +412,16 @@ struct VodInfo: Decodable {
     var duration: String?
     var image: String?
     var trailer: String?
+    /// Imagen horizontal grande de la peli (fondo de la ficha).
+    var backdrop: String?
+
+    /// Reparto como lista ("A, B, C" -> ["A", "B", "C"]).
+    var castList: [String] {
+        (cast ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
 
     enum CodingKeys: String, CodingKey { case info }
-    enum K: String, CodingKey { case plot, cast, director, genre, releasedate, duration, movie_image, youtube_trailer }
+    enum K: String, CodingKey { case plot, cast, director, genre, releasedate, duration, movie_image, youtube_trailer, backdrop_path }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -427,6 +434,8 @@ struct VodInfo: Decodable {
             duration = i.flexString(.duration)
             image = i.flexString(.movie_image)
             trailer = i.flexString(.youtube_trailer).flatMap { $0.isEmpty ? nil : $0 }
+            let bd = (try? i.decodeIfPresent([String].self, forKey: .backdrop_path))?.first ?? i.flexString(.backdrop_path)
+            backdrop = bd.flatMap { $0.hasPrefix("http") ? $0 : nil }
         }
     }
 }

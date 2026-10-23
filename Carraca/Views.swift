@@ -251,6 +251,7 @@ struct MainTabView: View {
                 SportsView().tabItem { Label("Eventos", systemImage: "sportscourt") }
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) { ExpiryBanner() }
         .task {
             // Al abrir (no en mitad de un vídeo): unos segundos después de entrar.
             guard ReviewPrompt.shouldAsk else { return }
@@ -448,6 +449,91 @@ struct CategoryRow: View {
             Text(name).lineLimit(1)
             Spacer()
             Text("\(count)").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Pantalla de carga con la forma de lo que va a salir (filas de carátulas grises que laten).
+struct SkeletonRails: View {
+    @State private var dim = false
+    var poster = true
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                ForEach(0..<4, id: \.self) { _ in
+                    VStack(alignment: .leading, spacing: 10) {
+                        RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.10)).frame(width: 150, height: 18)
+                        HStack(spacing: 12) {
+                            ForEach(0..<6, id: \.self) { _ in
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Color.white.opacity(0.08))
+                                    .frame(width: poster ? 112 : 160, height: poster ? 168 : 92)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .scrollDisabled(true)
+        .opacity(dim ? 0.45 : 1)
+        .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: dim)
+        .onAppear { dim = true }
+        .accessibilityLabel("Cargando")
+    }
+}
+
+/// Lo mismo para las tarjetas de categorías de Directo.
+struct SkeletonCards: View {
+    @State private var dim = false
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12)], spacing: 12) {
+                ForEach(0..<12, id: \.self) { _ in
+                    RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.07)).frame(height: 100)
+                }
+            }
+            .padding()
+        }
+        .scrollDisabled(true)
+        .opacity(dim ? 0.45 : 1)
+        .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: dim)
+        .onAppear { dim = true }
+        .accessibilityLabel("Cargando")
+    }
+}
+
+/// Aviso arriba cuando la cuenta está a punto de caducar (se puede cerrar; vuelve al día siguiente).
+struct ExpiryBanner: View {
+    @EnvironmentObject private var session: Session
+    @AppStorage("carraca.expiry.hiddenDay") private var hiddenDay = ""
+
+    private var today: String { Date().formatted(.iso8601.year().month().day()) }
+
+    private var days: Int? {
+        guard let exp = session.account?.expDate else { return nil }
+        let d = Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: Date()),
+                                                to: Calendar.current.startOfDay(for: exp)).day ?? 99
+        return d <= 7 ? d : nil
+    }
+
+    var body: some View {
+        if let d = days, hiddenDay != today {
+            HStack(spacing: 10) {
+                Image(systemName: d < 0 ? "exclamationmark.triangle.fill" : "clock.badge.exclamationmark")
+                Text(d < 0 ? "Tu cuenta ha caducado." : d == 0 ? "Tu cuenta caduca hoy." :
+                        d == 1 ? "Tu cuenta caduca mañana." : "Tu cuenta caduca en \(d) días.")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Button { hiddenDay = today } label: { Image(systemName: "xmark").font(.caption.bold()) }
+                    .accessibilityLabel("Cerrar aviso")
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(d <= 1 ? Color.red.opacity(0.85) : Color.orange.opacity(0.85))
         }
     }
 }

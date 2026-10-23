@@ -398,7 +398,12 @@ struct PlayerView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(title).font(.headline).lineLimit(1)
                         if let s = item.subtitle { Text(s).font(.subheadline).opacity(0.8).lineLimit(1) }
-                        if let now = epg.first { Text("Ahora: \(now.title)").font(.subheadline).lineLimit(1) }
+                        if let now = epg.first {
+                            Text("Ahora: \(now.title)").font(.subheadline).lineLimit(1)
+                            if let a = now.start, let b = now.end {
+                                ProgramProgress(entry: GuideEntry(start: a, end: b, title: now.title)).frame(width: 160)
+                            }
+                        }
                         if epg.count > 1 { Text("Después: \(epg[1].title)").font(.caption).opacity(0.75).lineLimit(1) }
                         if let end = sleepEnd {
                             Label("Se apaga a las \(end.formatted(date: .omitted, time: .shortened))", systemImage: "moon.zzz")

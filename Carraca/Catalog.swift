@@ -47,7 +47,7 @@ struct LiveView: View {
         NavigationSplitView {
             Group {
                 if streams.isEmpty && loading {
-                    LoadingView()
+                    SkeletonCards()
                 } else if streams.isEmpty, let error {
                     ErrorView(message: error) { Task { await load(force: true) } }
                 } else {
@@ -136,7 +136,7 @@ struct LiveView: View {
         NavigationStack {
             Group {
                 if streams.isEmpty && loading {
-                    LoadingView()
+                    SkeletonCards()
                 } else if streams.isEmpty, let error {
                     ErrorView(message: error) { Task { await load(force: true) } }
                 } else if !query.isEmpty {
@@ -508,9 +508,26 @@ struct ChannelTitle: View {
                 }
             }
             if let now = session.nowNext(stream).first {
-                Text("Ahora: \(now.title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                HStack(spacing: 8) {
+                    Text("Ahora: \(now.title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    ProgramProgress(entry: now).frame(width: 46)
+                }
             }
         }
+    }
+}
+
+/// Barrita con lo que lleva emitido el programa actual.
+struct ProgramProgress: View {
+    let entry: GuideEntry
+
+    var body: some View {
+        let total = entry.end.timeIntervalSince(entry.start)
+        let done = Date().timeIntervalSince(entry.start)
+        ProgressView(value: total > 0 ? min(1, max(0, done / total)) : 0)
+            .tint(.accentColor)
+            .scaleEffect(x: 1, y: 0.7)
+            .accessibilityLabel("Progreso del programa")
     }
 }
 
@@ -573,7 +590,7 @@ struct MoviesView: View {
     @ViewBuilder
     private var main: some View {
         if movies.isEmpty && loading {
-            LoadingView()
+            SkeletonRails()
         } else if movies.isEmpty, let error {
             ErrorView(message: error) { Task { await load(force: true) } }
         } else if !query.isEmpty {
@@ -749,6 +766,21 @@ struct MovieDetailView: View {
 
     var body: some View {
         ScrollView {
+            // Fondo: la imagen horizontal de la peli o, si no hay, la carátula desenfocada.
+            Color.clear
+                .frame(height: 230)
+                .overlay {
+                    if let b = info?.backdrop {
+                        RemoteImage(url: b)
+                    } else {
+                        RemoteImage(url: movie.icon ?? info?.image).blur(radius: 28).opacity(0.7)
+                    }
+                }
+                .overlay {
+                    LinearGradient(colors: [.clear, Color("LaunchBg").opacity(0.6), Color("LaunchBg")],
+                                   startPoint: .top, endPoint: .bottom)
+                }
+                .clipped()
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top, spacing: 16) {
                     Color.clear
@@ -756,6 +788,7 @@ struct MovieDetailView: View {
                         .frame(width: 140)
                         .overlay { RemoteImage(url: movie.icon ?? info?.image) }
                         .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
                     VStack(alignment: .leading, spacing: 6) {
                         Text(movie.name.cleanTitle).font(.title3.bold())
                         if let g = info?.genre, !g.isEmpty { Text(g).font(.subheadline).foregroundStyle(.secondary) }
@@ -807,12 +840,30 @@ struct MovieDetailView: View {
 
                 if let p = info?.plot, !p.isEmpty { Text(p).foregroundStyle(.secondary) }
                 if let d = info?.director, !d.isEmpty { Text("Dirección: \(d)").font(.footnote).foregroundStyle(.secondary) }
-                if let c = info?.cast, !c.isEmpty { Text("Reparto: \(c)").font(.footnote).foregroundStyle(.secondary) }
+                if let cast = info?.castList, !cast.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Reparto").font(.headline)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(cast.prefix(15), id: \.self) { name in
+                                    Text(name)
+                                        .font(.footnote)
+                                        .padding(.horizontal, 12).padding(.vertical, 7)
+                                        .background(Capsule().fill(Color.white.opacity(0.08)))
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            .padding()
+            .padding(.horizontal)
+            .padding(.bottom)
+            .padding(.top, -110)
             .frame(maxWidth: 720, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
+        .ignoresSafeArea(edges: .top)
+        .background(Color("LaunchBg").ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         .task { info = try? await session.api?.vodInfo(movie.id) }
         .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
@@ -871,7 +922,7 @@ struct SeriesView: View {
     @ViewBuilder
     private var main: some View {
         if items.isEmpty && loading {
-            LoadingView()
+            SkeletonRails()
         } else if items.isEmpty, let error {
             ErrorView(message: error) { Task { await load(force: true) } }
         } else if !query.isEmpty {
