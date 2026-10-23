@@ -50,6 +50,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         ended = false
         buffering = true
         seekTarget = nil
+        restoreTracks = nil
         ignoreStopUntil = Date().addingTimeInterval(3)
         guard let media = VLCMedia(url: url) else { failed = true; return }
         media.addOption(":network-caching=\(live ? (muted ? 1500 : 2500) : 4000)")
@@ -88,17 +89,20 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         let from = seekTarget ?? timeMs
         let offset = target - from
         guard offset != 0 else { return }
-        if abs(offset) > 60_000, !live, let url {
-            // Salto grande: VLC 4 no salta bien dentro de un archivo por internet (lo lee seguido
-            // hasta llegar o se queda parado). Reabrirlo ya en ese punto es casi inmediato.
+        if abs(offset) > 60_000, !live, restoreTracks == nil {
+            // Salto grande. Los MKV del proveedor solo tienen índice (Cues) del vídeo: con el audio
+            // activo, VLC busca un punto común para todas las pistas, el del audio es el principio
+            // del archivo y se lo lee entero por HTTP hasta llegar. Sin audio ni subtítulos salta
+            // directo al índice del vídeo; al llegar se vuelven a poner los mismos.
             let audio = player.audioTracks.first(where: { $0.isSelected })?.trackName
             let text = player.textTracks.first(where: { $0.isSelected })?.trackName
-            let keepMuted = muted
-            start(url: url, startMs: target, live: false, muted: keepMuted)
-            restoreTracks = (audio, text)
-        } else {
-            _ = player.jump(withOffset: Int32(clamping: offset), completion: nil)
+            restoreTracks = (audio ?? "", text)
+            player.deselectAllAudioTracks()
+            player.deselectAllTextTracks()
+            // por si VLC no llega a avisar del nuevo tiempo
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.applyRestoredTracks() }
         }
+        _ = player.jump(withOffset: Int32(clamping: offset), completion: nil)
         seekTarget = target
         seekStarted = Date()
         timeMs = target
@@ -109,7 +113,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func applyRestoredTracks() {
         guard let r = restoreTracks else { return }
         restoreTracks = nil
-        if let a = r.audio, let t = player.audioTracks.first(where: { $0.trackName == a }) {
+        let audios = player.audioTracks
+        if let t = audios.first(where: { $0.trackName == r.audio }) ?? audios.first {
             t.isSelectedExclusively = true
         }
         if let name = r.text {
@@ -197,10 +202,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.buffering = false
                 self.playing = true
                 self.retries = 0
-                if self.restoreTracks != nil {
-                    // las pistas aparecen un instante después de empezar
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.applyRestoredTracks() }
-                }
+
                 self.pipController?.invalidatePlaybackState()
             case .paused:
                 self.playing = false
@@ -230,6 +232,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 // Hasta que VLC llega al destino, sus tiempos son del sitio viejo: no los enseñamos.
                 if abs(t - target) > 15_000 && Date().timeIntervalSince(self.seekStarted) < 20 { return }
                 self.seekTarget = nil
+                // ya en el sitio nuevo: vuelven el audio y los subtítulos
+                if self.restoreTracks != nil { self.applyRestoredTracks() }
             }
             self.timeMs = t
             if let len = self.player.media?.length.intValue, len > 0 { self.lengthMs = Int(len) }
