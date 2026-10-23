@@ -28,6 +28,9 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var muted = false
     /// true tras halt()/stop(): los reintentos pendientes y el "stopped" que llega después se ignoran.
     private var halted = false
+    /// Salto en curso: a dónde se ha pedido ir y cuándo (VLC tarda en confirmar la nueva posición).
+    private var seekTarget: Int?
+    private var seekStarted = Date.distantPast
 
     override init() {
         super.init()
@@ -42,9 +45,12 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         failed = false
         ended = false
         buffering = true
+        seekTarget = nil
         guard let media = VLCMedia(url: url) else { failed = true; return }
         media.addOption(":network-caching=\(live ? (muted ? 1500 : 2500) : 4000)")
         if muted { media.addOption(":no-audio") }
+        // Saltos al fotograma clave más cercano (rápido) en vez de decodificar hasta el segundo exacto.
+        media.addOption(":input-fast-seek")
         if startMs > 0 { media.addOption(":start-time=\(Double(startMs) / 1000.0)") }
         player.media = media
         player.play()
@@ -61,11 +67,27 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func seek(toFraction f: Double) {
-        player.position = max(0, min(1, f))
+        let frac = max(0, min(1, f))
+        guard lengthMs > 0 else { player.position = frac; return }
+        seek(toMs: Int(Double(lengthMs) * frac))
     }
 
     func jump(_ seconds: Int32) {
-        if seconds >= 0 { player.jumpForward(Double(seconds)) } else { player.jumpBackward(Double(-seconds)) }
+        seek(toMs: (seekTarget ?? timeMs) + Int(seconds) * 1000)
+    }
+
+    /// Salto relativo y rápido (VLC 4: jump = seek "fast"; position/time = seek "preciso", muy lento
+    /// en pelis de varios GB). Varios saltos seguidos se encadenan desde el último destino pedido.
+    private func seek(toMs requested: Int) {
+        let target = max(0, lengthMs > 0 ? min(requested, lengthMs - 2000) : requested)
+        let from = seekTarget ?? timeMs
+        let offset = target - from
+        guard offset != 0 else { return }
+        seekTarget = target
+        seekStarted = Date()
+        timeMs = target
+        buffering = true
+        _ = player.jump(withOffset: Int32(clamping: offset), completion: nil)
     }
 
     func stop() {
@@ -169,7 +191,13 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func mediaPlayerTimeChanged(_ aNotification: Notification) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.timeMs = Int(self.player.time.intValue)
+            let t = Int(self.player.time.intValue)
+            if let target = self.seekTarget {
+                // Hasta que VLC llega al destino, sus tiempos son del sitio viejo: no los enseñamos.
+                if abs(t - target) > 15_000 && Date().timeIntervalSince(self.seekStarted) < 20 { return }
+                self.seekTarget = nil
+            }
+            self.timeMs = t
             if let len = self.player.media?.length.intValue, len > 0 { self.lengthMs = Int(len) }
             if self.buffering { self.buffering = false }
             if !self.playing && self.player.isPlaying { self.playing = true }
@@ -187,7 +215,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
         retries += 1
         buffering = true
-        let resumeAt = live ? 0 : timeMs
+        let resumeAt = live ? 0 : (seekTarget ?? timeMs)
         let isLive = live
         let isMuted = muted
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(3 * retries)) { [weak self] in
