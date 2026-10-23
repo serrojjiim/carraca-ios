@@ -761,8 +761,10 @@ struct VodGrid: View {
 struct MovieDetailView: View {
     let movie: VodStream
     @EnvironmentObject private var session: Session
+    @ObservedObject private var downloads = Downloads.shared
     @State private var info: VodInfo?
     @State private var playing: PlayItem?
+    @State private var showDownload = false
 
     var body: some View {
         ScrollView {
@@ -771,7 +773,7 @@ struct MovieDetailView: View {
                 .frame(height: 230)
                 .overlay {
                     if let b = info?.backdrop {
-                        RemoteImage(url: b)
+                        RemoteImage(url: b, maxPixel: 1400)
                     } else {
                         RemoteImage(url: movie.icon ?? info?.image).blur(radius: 28).opacity(0.7)
                     }
@@ -838,6 +840,8 @@ struct MovieDetailView: View {
                     .buttonStyle(.borderedProminent).controlSize(.large)
                 }
 
+                downloadButton
+
                 if let p = info?.plot, !p.isEmpty { Text(p).foregroundStyle(.secondary) }
                 if let d = info?.director, !d.isEmpty { Text("Dirección: \(d)").font(.footnote).foregroundStyle(.secondary) }
                 if let cast = info?.castList, !cast.isEmpty {
@@ -866,11 +870,43 @@ struct MovieDetailView: View {
         .background(Color("LaunchBg").ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         .task { info = try? await session.api?.vodInfo(movie.id) }
+        .sheet(isPresented: $showDownload) { DownloadOptionsView(movie: movie) }
         .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
+    }
+
+    /// Descargar / descargando / descargada (en ese caso se reproduce el fichero local).
+    @ViewBuilder
+    private var downloadButton: some View {
+        if !session.isM3U {
+            if let d = downloads.item("m\(movie.id)") {
+                HStack {
+                    switch d.state {
+                    case .done: Label("Descargada · \(byteText(d.total))", systemImage: "arrow.down.circle.fill").foregroundStyle(.green)
+                    case .downloading: Label("Descargando \(Int(d.progress * 100)) %", systemImage: "arrow.down.circle")
+                    default: Label("En descargas", systemImage: "arrow.down.circle.dotted")
+                    }
+                    Spacer()
+                    Button(role: .destructive) { downloads.remove(d.id) } label: { Image(systemName: "trash") }
+                        .accessibilityLabel("Borrar descarga")
+                }
+                .font(.subheadline)
+            } else {
+                Button { showDownload = true } label: {
+                    Label("Descargar", systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered).controlSize(.large)
+            }
+        }
     }
 
     private func play(from ms: Int) {
         guard let api = session.api else { return }
+        // si está descargada, se ve desde el iPhone (sin gastar datos ni la conexión de la cuenta)
+        if let d = downloads.item("m\(movie.id)"), d.state == .done {
+            playing = PlayItem(url: downloads.fileURL(d), title: movie.name.cleanTitle, startMs: ms,
+                               resume: ResumeTarget(type: "movie", name: movie.name, itemId: String(movie.id)))
+            return
+        }
         playing = PlayItem(url: api.movieURL(movie), title: movie.name.cleanTitle, startMs: ms,
                            resume: ResumeTarget(type: "movie", name: movie.name, itemId: String(movie.id)))
     }
@@ -1050,7 +1086,7 @@ struct HeroBanner: View {
         Color.clear
             .frame(maxWidth: .infinity)
             .frame(height: height)
-            .overlay { RemoteImage(url: series.backdrop) }
+            .overlay { RemoteImage(url: series.backdrop, maxPixel: 1400) }
             .overlay {
                 LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .center, endPoint: .bottom)
             }
@@ -1182,6 +1218,7 @@ struct SeriesDetailView: View {
                         let seen = isWatched(ep)
                         Button { play(ep, from: resumeMs(for: ep)) } label: {
                             EpisodeRow(episode: ep, progress: progress(for: ep), watched: seen)
+                                .overlay(alignment: .trailing) { DownloadBadge(id: "e\(ep.id)").padding(.trailing, 34) }
                         }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button { toggleWatched(ep) } label: {
@@ -1195,6 +1232,16 @@ struct SeriesDetailView: View {
                             }
                             Button { markSeasonUpTo(ep) } label: {
                                 Label("Marcar vistos hasta aquí", systemImage: "checkmark.circle.badge.questionmark")
+                            }
+                            if Downloads.shared.item("e\(ep.id)") == nil {
+                                Button { download(ep) } label: { Label("Descargar", systemImage: "arrow.down.circle") }
+                                Button { downloadSeason(from: ep) } label: {
+                                    Label("Descargar los que quedan de la temporada", systemImage: "arrow.down.circle.dotted")
+                                }
+                            } else {
+                                Button(role: .destructive) { Downloads.shared.remove("e\(ep.id)") } label: {
+                                    Label("Borrar descarga", systemImage: "trash")
+                                }
                             }
                         }
                     }
@@ -1282,7 +1329,32 @@ struct SeriesDetailView: View {
 
     private func play(_ ep: Episode, from ms: Int, season forced: Int? = nil) {
         guard let api = session.api else { return }
-        playing = Self.episodeItem(series: series, ep: ep, season: forced ?? seasonOf(ep), from: ms, api: api, info: info)
+        var item = Self.episodeItem(series: series, ep: ep, season: forced ?? seasonOf(ep), from: ms, api: api, info: info)
+        // descargado: desde el iPhone
+        if let d = Downloads.shared.item("e\(ep.id)"), d.state == .done {
+            let next = item.next
+            item = PlayItem(url: Downloads.shared.fileURL(d), title: item.title, subtitle: item.subtitle,
+                            startMs: ms, resume: item.resume)
+            item.next = next
+        }
+        playing = item
+    }
+
+    private func download(_ ep: Episode) {
+        guard let api = session.api else { return }
+        let s = seasonOf(ep)
+        Downloads.shared.enqueue(DownloadItem(id: "e\(ep.id)", kind: "series", title: series.name.cleanTitle,
+                                              subtitle: "T\(s) · E\(ep.number) · \(ep.title.cleanTitle)",
+                                              image: ep.image ?? series.cover, remote: api.episodeURL(ep).absoluteString,
+                                              ext: ep.ext, resumeName: series.name, itemId: ep.id,
+                                              season: s, episode: ep.number))
+    }
+
+    /// Este capítulo y los siguientes de la temporada que no estén vistos.
+    private func downloadSeason(from ep: Episode) {
+        for e in info?.episodes[season] ?? [] where e.number >= ep.number && !isWatched(e) {
+            download(e)
+        }
     }
 
     /// Lo que se reproduce para un capítulo, con el siguiente ya preparado (siguiente capítulo automático).
@@ -1339,6 +1411,8 @@ struct EpisodeRow: View {
 
 struct ContinueView: View {
     @EnvironmentObject private var session: Session
+    /// Pestaña: Seguir viendo o Descargas.
+    @State private var section = 0
     @State private var allSeries: [SeriesItem] = []
     /// Carátula de cada peli por nombre (de la lista de pelis, que está en caché).
     @State private var movieIcons: [String: String] = [:]
@@ -1346,6 +1420,17 @@ struct ContinueView: View {
 
     var body: some View {
         NavigationStack {
+            VStack(spacing: 0) {
+            Picker("Sección", selection: $section) {
+                Text("Seguir viendo").tag(0)
+                Text("Descargas").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            if section == 1 {
+                DownloadsList()
+            } else {
             List(session.resume) { item in
                 row(item)
                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -1364,7 +1449,9 @@ struct ContinueView: View {
                 }
             }
             .refreshable { await session.refreshResume() }
-            .navigationTitle("Seguir viendo")
+            }
+            }
+            .navigationTitle(section == 1 ? "Descargas" : "Seguir viendo")
             .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
             .withSettings()
         }

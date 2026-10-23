@@ -346,6 +346,8 @@ struct PlayerView: View {
             UIApplication.shared.isIdleTimerDisabled = true
             setOrientation(.landscape)
             if item.isLive, !item.channels.isEmpty { channelIndex = item.channelIndex }
+            // la cuenta solo admite una conexión: si se está descargando algo, se pausa mientras tanto
+            if !item.url.isFileURL { Downloads.shared.pauseForPlayback() }
             vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
             rememberChannel()
             setUpRemoteCommands()
@@ -355,6 +357,7 @@ struct PlayerView: View {
             report()
             vlc.stop()
             tearDownRemoteCommands()
+            Downloads.shared.resumeAfterPlayback()
             UIApplication.shared.isIdleTimerDisabled = false
             setOrientation(.portrait)
         }

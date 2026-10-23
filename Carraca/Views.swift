@@ -39,6 +39,21 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         UIDevice.current.userInterfaceIdiom == .pad ? .all : Self.orientationLock
     }
+
+    /// iOS despierta la app cuando acaba una descarga hecha con la app cerrada.
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        Task { @MainActor in
+            Downloads.shared.backgroundCompletion = completionHandler
+            _ = Downloads.shared.items     // crea la sesión y se reengancha
+        }
+    }
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        Task { @MainActor in _ = Downloads.shared.items }   // retoma descargas pendientes
+        return true
+    }
 }
 
 @main
@@ -49,6 +64,7 @@ struct CarracaApp: App {
 
     init() {
         ReviewPrompt.countLaunch()
+        ImageLoader.trim()
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         URLCache.shared = URLCache(memoryCapacity: 64 << 20, diskCapacity: 400 << 20)
     }
@@ -389,18 +405,25 @@ extension View {
 struct RemoteImage: View {
     let url: String?
     var contentMode: ContentMode = .fill
+    /// Tamaño máximo (px) al que se guarda: pósteres y logos pequeños, fondos más grandes.
+    var maxPixel = 480
+    @State private var image: UIImage?
 
     var body: some View {
-        if let s = url, let u = URL(string: s) {
-            AsyncImage(url: u, transaction: Transaction(animation: .easeIn(duration: 0.15))) { phase in
-                if let img = phase.image {
-                    img.resizable().aspectRatio(contentMode: contentMode)
-                } else {
-                    placeholder
-                }
+        ZStack {
+            if let image {
+                Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+                    .transition(.opacity)
+            } else {
+                placeholder
             }
-        } else {
-            placeholder
+        }
+        .task(id: url) {
+            guard let s = url, let u = URL(string: s) else { image = nil; return }
+            if let m = ImageLoader.shared.cached(u, maxPixel: maxPixel) { image = m; return }
+            image = nil
+            let loaded = await ImageLoader.shared.image(u, maxPixel: maxPixel)
+            withAnimation(.easeIn(duration: 0.15)) { image = loaded }
         }
     }
 
@@ -669,6 +692,8 @@ struct PosterRail<T: Identifiable & Hashable>: View {
                 .padding(.horizontal)
             }
         }
+        // carátulas de la fila listas antes de deslizar
+        .onAppear { ImageLoader.shared.prefetch(items.prefix(12).map(imageOf)) }
     }
 }
 
