@@ -39,6 +39,37 @@ struct PlayItem: Identifiable {
     var channels: [LiveStream] = []
     var channelIndex = 0
     var channelURL: ((LiveStream) -> URL)? = nil
+    /// Series: lo que va después (siguiente capítulo automático al acabar).
+    var next: (() -> PlayItem?)? = nil
+}
+
+/// Preferencias de reproducción (Ajustes > Reproducción).
+enum PlaybackPrefs {
+    static let audioKey = "carraca.pref.audio"          // "" | castellano | latino | ingles
+    static let subsKey = "carraca.pref.subs"            // "" | off | castellano | ingles | forzados
+    static let autoNextKey = "carraca.pref.autonext"    // Bool (por defecto true)
+
+    static var audio: String { UserDefaults.standard.string(forKey: audioKey) ?? "" }
+    static var subs: String { UserDefaults.standard.string(forKey: subsKey) ?? "" }
+    static var autoNext: Bool { UserDefaults.standard.object(forKey: autoNextKey) as? Bool ?? true }
+
+    /// ¿El nombre de la pista encaja con la preferencia?
+    static func matches(_ name: String, _ pref: String) -> Bool {
+        let n = name.lowercased()
+        switch pref {
+        case "castellano":
+            if ["latino", "latam", "lat)", "mexic"].contains(where: { n.contains($0) }) { return false }
+            return ["castellano", "españa", "spain", "spa", "esp", "español", "spanish"].contains(where: { n.contains($0) })
+        case "latino":
+            return ["latino", "latam", "lat", "mexic"].contains(where: { n.contains($0) })
+        case "ingles":
+            return ["eng", "english", "inglés", "ingles"].contains(where: { n.contains($0) })
+        case "forzados":
+            return ["forz", "forced"].contains(where: { n.contains($0) })
+        default:
+            return false
+        }
+    }
 }
 
 struct ResumeTarget {
@@ -108,6 +139,65 @@ final class Session: ObservableObject {
         creds = c
         api = c.m3u == nil ? XtreamAPI(base: c.server, user: c.user, pass: c.pass) : nil
         favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
+        watchlist = UserDefaults.standard.stringArray(forKey: watchlistKey) ?? []
+        guide = [:]
+        guideLoaded = .distantPast
+    }
+
+    // MARK: Guía "ahora / después" (solo cuentas del servidor Carraca: la genera su panel)
+
+    @Published private(set) var guide: [String: [GuideEntry]] = [:]
+    private var guideLoaded = Date.distantPast
+
+    var guideEnabled: Bool { isCarracaServer }
+
+    /// Una petición para todos los canales; como mucho cada 10 minutos.
+    func refreshGuide(force: Bool = false) async {
+        guard guideEnabled, force || Date().timeIntervalSince(guideLoaded) > 600 else { return }
+        guideLoaded = Date()
+        guard let url = URL(string: AppConfig.panel + "/epg_now.php"),
+              let res = try? await URLSession.shared.data(from: url),
+              let obj = try? JSONSerialization.jsonObject(with: res.0) as? [String: Any],
+              let chans = obj["c"] as? [String: [[Any]]] else { return }
+        var g: [String: [GuideEntry]] = [:]
+        for (id, list) in chans {
+            g[id] = list.compactMap { p in
+                guard p.count >= 3, let a = (p[0] as? NSNumber)?.doubleValue, let b = (p[1] as? NSNumber)?.doubleValue,
+                      let t = p[2] as? String else { return nil }
+                return GuideEntry(start: Date(timeIntervalSince1970: a), end: Date(timeIntervalSince1970: b), title: t)
+            }
+        }
+        guide = g
+    }
+
+    /// Lo que echan ahora (y después) en un canal.
+    func nowNext(_ s: LiveStream) -> [GuideEntry] {
+        guard let id = s.epgId, let list = guide[id] else { return [] }
+        let now = Date()
+        return Array(list.filter { $0.end > now }.prefix(2))
+    }
+
+    // MARK: Último canal visto
+
+    private var lastChannelKey: String { "carraca.lastch." + favoritesKey }
+    var lastChannelID: Int? {
+        get { UserDefaults.standard.object(forKey: lastChannelKey) as? Int }
+        set { UserDefaults.standard.set(newValue, forKey: lastChannelKey); objectWillChange.send() }
+    }
+
+    // MARK: Mi lista (pelis y series para ver luego, en el dispositivo)
+
+    @Published private(set) var watchlist: [String] = []
+    private var watchlistKey: String { "carraca.milista." + favoritesKey }
+
+    static func listKey(movie id: Int) -> String { "m\(id)" }
+    static func listKey(series id: Int) -> String { "s\(id)" }
+
+    func inList(_ key: String) -> Bool { watchlist.contains(key) }
+
+    func toggleList(_ key: String) {
+        if let i = watchlist.firstIndex(of: key) { watchlist.remove(at: i) } else { watchlist.insert(key, at: 0) }
+        UserDefaults.standard.set(watchlist, forKey: watchlistKey)
     }
 
     // MARK: Favoritos (por cuenta, guardados en el dispositivo)
@@ -297,9 +387,41 @@ final class Session: ObservableObject {
         account = nil
         resume = []
         watched = []
+        watchlist = []
+        guide = [:]
     }
 
     // MARK: Seguir viendo
+
+    /// Quitar algo de "Seguir viendo" (deslizar a la izquierda) sin marcarlo como visto.
+    func removeResume(_ item: ResumeItem) {
+        resume.removeAll { $0.type == item.type && $0.name == item.name }
+        guard let user = creds?.user else { return }
+        if remoteResume {
+            let body: [String: Any] = ["user": user, "action": "borrar", "type": item.type, "name": item.name]
+            var req = URLRequest(url: AppConfig.resumeURL)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            URLSession.shared.dataTask(with: req).resume()
+        } else {
+            LocalResume.remove(type: item.type, name: item.name)
+        }
+    }
+
+    /// URL guardada en "Seguir viendo" con el usuario y la contraseña de esta cuenta
+    /// (el panel ya no devuelve las credenciales en la respuesta pública).
+    func playableURL(_ raw: String) -> URL? {
+        guard let c = creds, c.m3u == nil, !raw.isEmpty else { return URL(string: raw) }
+        let enc: (String) -> String = {
+            $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? $0
+        }
+        let fixed = raw.replacingOccurrences(of: #"/(movie|series)/[^/]+/[^/]+/"#,
+                                             with: "/$1/" + NSRegularExpression.escapedTemplate(for: enc(c.user)) + "/"
+                                                 + NSRegularExpression.escapedTemplate(for: enc(c.pass)) + "/",
+                                             options: .regularExpression)
+        return URL(string: fixed)
+    }
 
     func refreshResume() async {
         await refreshWatched()

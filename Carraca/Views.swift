@@ -268,6 +268,9 @@ struct SettingsView: View {
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
     @State private var manage = false
+    @AppStorage(PlaybackPrefs.audioKey) private var prefAudio = ""
+    @AppStorage(PlaybackPrefs.subsKey) private var prefSubs = ""
+    @AppStorage(PlaybackPrefs.autoNextKey) private var prefAutoNext = true
 
     var body: some View {
         NavigationStack {
@@ -305,6 +308,26 @@ struct SettingsView: View {
                     }
                 }
                 Section {
+                    Picker("Idioma de audio", selection: $prefAudio) {
+                        Text("El que venga").tag("")
+                        Text("Castellano").tag("castellano")
+                        Text("Latino").tag("latino")
+                        Text("Inglés").tag("ingles")
+                    }
+                    Picker("Subtítulos", selection: $prefSubs) {
+                        Text("Como vengan").tag("")
+                        Text("Desactivados").tag("off")
+                        Text("Castellano").tag("castellano")
+                        Text("Inglés").tag("ingles")
+                        Text("Solo forzados").tag("forzados")
+                    }
+                    Toggle("Siguiente capítulo automático", isOn: $prefAutoNext)
+                } header: {
+                    Text("Reproducción")
+                } footer: {
+                    Text("Si el vídeo trae ese idioma o subtítulo, se pone solo al empezar.")
+                }
+                Section {
                     Button("Recargar listas de canales y películas") {
                         DiskCache.clear()
                         session.reloadToken += 1
@@ -338,14 +361,21 @@ struct SettingsView: View {
 
 private struct SettingsButton: ViewModifier {
     @State private var show = false
+    @State private var search = false
     func body(content: Content) -> some View {
         content
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { show = true } label: { Image(systemName: "gearshape") }
+                    HStack(spacing: 4) {
+                        Button { search = true } label: { Image(systemName: "magnifyingglass") }
+                            .accessibilityLabel("Buscar en todo")
+                        Button { show = true } label: { Image(systemName: "gearshape") }
+                            .accessibilityLabel("Ajustes")
+                    }
                 }
             }
             .sheet(isPresented: $show) { SettingsView() }
+            .sheet(isPresented: $search) { GlobalSearchView() }
     }
 }
 

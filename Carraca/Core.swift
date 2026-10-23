@@ -130,6 +130,12 @@ extension String {
         return self
     }
 
+    /// "Ice Age 4 (2012)" -> 2012 (o el primer año razonable que aparezca).
+    var yearGuess: Int? {
+        guard let r = range(of: #"(19[3-9]\d|20[0-4]\d)"#, options: .regularExpression) else { return nil }
+        return Int(self[r])
+    }
+
     /// Como seriesBaseName pero sin distinguir mayúsculas ("s01e20" también vale).
     var seriesBaseNameAnyCase: String {
         if let r = range(of: #"\s*-?\s*[Ss]\d{1,2}\s*[Ee]\d{1,3}.*$"#, options: .regularExpression) {
@@ -232,6 +238,8 @@ struct LiveStream: Decodable, Identifiable, Hashable {
     let categoryId: String
     /// Solo en listas M3U: URL directa del canal.
     var directURL: URL? = nil
+    /// Id del canal en la guía XMLTV (para "ahora / después").
+    var epgId: String? = nil
 
     /// "Canales" que solo hacen de título de sección ("#### TELEFÓNICA ####", con bandera de icono).
     var isSeparator: Bool { name.range(of: #"#{3,}|={4,}|-{5,}|\*{4,}"#, options: .regularExpression) != nil }
@@ -244,7 +252,7 @@ struct LiveStream: Decodable, Identifiable, Hashable {
         self.directURL = directURL
     }
 
-    enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id }
+    enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id, epg_channel_id }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -255,6 +263,7 @@ struct LiveStream: Decodable, Identifiable, Hashable {
         name = c.flexString(.name) ?? "Canal \(id)"
         icon = c.flexString(.stream_icon).flatMap { $0.isEmpty ? nil : $0 }
         categoryId = c.flexString(.category_id) ?? ""
+        epgId = c.flexString(.epg_channel_id).flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 
@@ -267,10 +276,12 @@ struct VodStream: Decodable, Identifiable, Hashable {
     let rating: String?
     /// Fecha de alta en el proveedor (para "Recién añadidas").
     let added: Int
+    let trailer: String?
 
     var score: Double { Double(rating ?? "") ?? 0 }
+    var year: Int? { name.yearGuess }
 
-    enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id, container_extension, rating, added }
+    enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id, container_extension, rating, added, trailer }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -284,6 +295,7 @@ struct VodStream: Decodable, Identifiable, Hashable {
         ext = c.flexString(.container_extension).flatMap { $0.isEmpty ? nil : $0 } ?? "mp4"
         rating = c.flexString(.rating)
         added = c.flexInt(.added) ?? 0
+        trailer = c.flexString(.trailer).flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 
@@ -298,8 +310,18 @@ struct SeriesItem: Decodable, Identifiable, Hashable {
     /// Imagen horizontal grande (portada destacada).
     let backdrop: String?
     let updated: Int
+    let trailer: String?
+    let rating: String?
 
-    enum CodingKeys: String, CodingKey { case series_id, name, cover, category_id, plot, genre, releaseDate, backdrop_path, last_modified }
+    var score: Double { Double(rating ?? "") ?? 0 }
+    var year: Int? { (releaseDate ?? "").yearGuess ?? name.yearGuess }
+    /// Géneros sueltos ("Drama, Comedia" -> ["Drama", "Comedia"]).
+    var genres: [String] {
+        (genre ?? "").split(whereSeparator: { ",/".contains($0) })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    enum CodingKeys: String, CodingKey { case series_id, name, cover, category_id, plot, genre, releaseDate, backdrop_path, last_modified, youtube_trailer, rating }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -317,6 +339,8 @@ struct SeriesItem: Decodable, Identifiable, Hashable {
         let bd = (try? c.decodeIfPresent([String].self, forKey: .backdrop_path))?.first ?? c.flexString(.backdrop_path)
         backdrop = bd.flatMap { $0.hasPrefix("http") ? $0 : nil }
         updated = c.flexInt(.last_modified) ?? 0
+        trailer = c.flexString(.youtube_trailer).flatMap { $0.isEmpty ? nil : $0 }
+        rating = c.flexString(.rating)
     }
 }
 
@@ -387,9 +411,10 @@ struct VodInfo: Decodable {
     var release: String?
     var duration: String?
     var image: String?
+    var trailer: String?
 
     enum CodingKeys: String, CodingKey { case info }
-    enum K: String, CodingKey { case plot, cast, director, genre, releasedate, duration, movie_image }
+    enum K: String, CodingKey { case plot, cast, director, genre, releasedate, duration, movie_image, youtube_trailer }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -401,8 +426,24 @@ struct VodInfo: Decodable {
             release = i.flexString(.releasedate)
             duration = i.flexString(.duration)
             image = i.flexString(.movie_image)
+            trailer = i.flexString(.youtube_trailer).flatMap { $0.isEmpty ? nil : $0 }
         }
     }
+}
+
+/// Enlace de un tráiler: el proveedor da el id de YouTube o la URL entera.
+func trailerURL(_ raw: String?) -> URL? {
+    guard let r = raw?.trimmingCharacters(in: .whitespaces), !r.isEmpty else { return nil }
+    if r.lowercased().hasPrefix("http") { return URL(string: r) }
+    guard r.range(of: #"^[A-Za-z0-9_-]{6,20}$"#, options: .regularExpression) != nil else { return nil }
+    return URL(string: "https://www.youtube.com/watch?v=" + r)
+}
+
+/// Programa de la guía ("ahora / después").
+struct GuideEntry: Hashable {
+    let start: Date
+    let end: Date
+    let title: String
 }
 
 struct AuthResponse: Decodable {
@@ -431,6 +472,12 @@ struct EPGEntry: Decodable, Identifiable {
     let end: Date?
 
     enum CodingKeys: String, CodingKey { case title, start_timestamp, stop_timestamp }
+
+    init(title: String, start: Date?, end: Date?) {
+        self.title = title
+        self.start = start
+        self.end = end
+    }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -560,6 +607,11 @@ enum LocalResume {
         }
     }
 
+    static func remove(type: String, name: String) {
+        let list = load().filter { !($0.type == type && $0.name == name) }
+        if let d = try? JSONEncoder().encode(list) { UserDefaults.standard.set(d, forKey: key) }
+    }
+
     static func clear() { UserDefaults.standard.removeObject(forKey: key) }
 }
 
@@ -615,12 +667,21 @@ final class XtreamAPI: @unchecked Sendable {
            let value = try? JSONDecoder().decode(T.self, from: data) {
             return value
         }
-        let (data, resp) = try await session.data(from: endpoint(action, extra))
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        guard code == 200 else { throw APIError.http(code) }
-        guard let value = try? JSONDecoder().decode(T.self, from: data) else { throw APIError.badResponse }
-        if let key { DiskCache.write(key, data) }
-        return value
+        do {
+            let (data, resp) = try await session.data(from: endpoint(action, extra))
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else { throw APIError.http(code) }
+            guard let value = try? JSONDecoder().decode(T.self, from: data) else { throw APIError.badResponse }
+            if let key { DiskCache.write(key, data) }
+            return value
+        } catch {
+            // Sin red o el servidor falla: mejor la lista que ya teníamos (aunque sea vieja) que una pantalla de error.
+            if let key, maxAge > 0, let data = DiskCache.read(key, maxAge: .infinity),
+               let value = try? JSONDecoder().decode(T.self, from: data) {
+                return value
+            }
+            throw error
+        }
     }
 
     func authenticate() async throws -> AuthResponse {

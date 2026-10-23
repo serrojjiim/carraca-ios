@@ -26,11 +26,15 @@ struct LiveView: View {
         Group {
             if hsize == .regular { splitBody } else { stackBody }
         }
-        .task { if streams.isEmpty { await load() } }
+        .task {
+            if streams.isEmpty { await load() }
+            await session.refreshGuide()
+        }
         .onChange(of: session.reloadToken) { _ in
             Task {
                 reloading = true
                 await load(force: true)
+                await session.refreshGuide(force: true)
                 reloading = false
             }
         }
@@ -77,6 +81,7 @@ struct LiveView: View {
     private var sidebar: some View {
         let favs = channels(in: Category.favorites)
         return List(selection: $selected) {
+            lastChannelButton
             if !favs.isEmpty {
                 CategoryListRow(name: "Favoritos", tag: nil, count: favs.count, logo: favs.first?.icon, symbol: "star.fill")
                     .tag(Category.favorites)
@@ -91,6 +96,31 @@ struct LiveView: View {
         }
         .listStyle(.sidebar)
         .refreshable { await load(force: true) }
+    }
+
+    /// "Seguir viendo · <último canal>" (abre el canal con su categoría para poder cambiar).
+    @ViewBuilder
+    private var lastChannelButton: some View {
+        if query.isEmpty, let id = session.lastChannelID, let ch = streams.first(where: { $0.id == id }) {
+            Button { play(ch, in: streams.filter { $0.categoryId == ch.categoryId }) } label: {
+                HStack(spacing: 12) {
+                    RemoteImage(url: ch.icon, contentMode: .fit)
+                        .frame(width: 52, height: 34)
+                        .background(Color.white.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Seguir viendo").font(.caption).foregroundStyle(.secondary)
+                        Text(ch.name.channelLabel.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                    }
+                    Spacer()
+                    Image(systemName: "play.fill").foregroundStyle(Color.accentColor)
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.accentColor.opacity(0.12)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
     }
 
     private func title(of cat: Category) -> String {
@@ -139,6 +169,7 @@ struct LiveView: View {
     private var grid: some View {
         let favs = channels(in: Category.favorites)
         return ScrollView {
+            lastChannelButton.padding(.horizontal).padding(.top, 8)
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12)], spacing: 12) {
                 if !favs.isEmpty {
                     NavigationLink(value: Category.favorites) {
@@ -169,6 +200,7 @@ struct LiveView: View {
     private var categoryList: some View {
         let favs = channels(in: Category.favorites)
         return List {
+            lastChannelButton
             if !favs.isEmpty {
                 NavigationLink(value: Category.favorites) {
                     CategoryListRow(name: "Favoritos", tag: nil, count: favs.count, logo: favs.first?.icon, symbol: "star.fill")
@@ -293,12 +325,7 @@ struct ChannelListView: View {
                         .frame(width: 60, height: 40)
                         .background(Color.white.opacity(0.04))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
-                    let l = s.name.channelLabel
-                    Text(l.name).lineLimit(1).foregroundStyle(.primary)
-                    if let t = l.tag { TagChip(text: t) }
-                    if session.isFavorite(s) {
-                        Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
-                    }
+                    ChannelTitle(stream: s)
                     Spacer()
                     Button { open(s, in: list) } label: {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
@@ -465,6 +492,28 @@ extension View {
     func favoriteActions(_ s: LiveStream) -> some View { modifier(FavoriteActions(stream: s)) }
 }
 
+/// Nombre del canal + etiqueta + favorito y, si hay guía, lo que echan ahora.
+struct ChannelTitle: View {
+    let stream: LiveStream
+    @EnvironmentObject private var session: Session
+
+    var body: some View {
+        let l = stream.name.channelLabel
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(l.name).lineLimit(1).foregroundStyle(.primary)
+                if let t = l.tag { TagChip(text: t) }
+                if session.isFavorite(stream) {
+                    Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
+                }
+            }
+            if let now = session.nowNext(stream).first {
+                Text("Ahora: \(now.title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+    }
+}
+
 struct ChannelRow: View {
     let stream: LiveStream
     @EnvironmentObject private var session: Session
@@ -475,12 +524,7 @@ struct ChannelRow: View {
                 .frame(width: 60, height: 40)
                 .background(Color.white.opacity(0.04))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
-            let l = stream.name.channelLabel
-            Text(l.name).lineLimit(1).foregroundStyle(.primary)
-            if let t = l.tag { TagChip(text: t) }
-            if session.isFavorite(stream) {
-                Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
-            }
+            ChannelTitle(stream: stream)
             Spacer()
             Image(systemName: "play.circle").foregroundStyle(Color.accentColor)
         }
@@ -501,6 +545,7 @@ struct MoviesView: View {
     @State private var byName: [String: VodStream] = [:]
     @State private var recent: [VodStream] = []
     @State private var top: [VodStream] = []
+    @State private var byID: [Int: VodStream] = [:]
     @State private var reloading = false
     @State private var loading = false
     @State private var error: String?
@@ -587,6 +632,11 @@ struct MoviesView: View {
                     PosterRail("Seguir viendo", items: cont, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
                                progress: { m in session.resumeFor(movie: m.name).map { Double($0.pro) / 100 } })
                 }
+                let mine = session.watchlist.compactMap { k in k.hasPrefix("m") ? Int(k.dropFirst()).flatMap { byID[$0] } : nil }
+                if !mine.isEmpty {
+                    PosterRail("Mi lista", items: mine, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                               watched: { session.isWatched(movie: $0.name) })
+                }
                 if !recent.isEmpty {
                     PosterRail("Recién añadidas", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
@@ -632,6 +682,7 @@ struct MoviesView: View {
             counts = cnt
             byCategory = by
             byName = Dictionary(all.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+            byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             recent = Array(newest.prefix(20))
             // Mejor nota entre las ~600 más recientes (en el catálogo antiguo hay notas sin sentido).
             top = Array(newest.prefix(600).filter { $0.score >= 6.5 && $0.score < 10 }.sorted { $0.score > $1.score }.prefix(20))
@@ -644,14 +695,29 @@ struct MoviesView: View {
     }
 }
 
+/// Orden de las cuadrículas de pelis y series.
+enum GridSort: String, CaseIterable {
+    case recent = "Más recientes", az = "A–Z", rating = "Mejor nota", year = "Año"
+}
+
 struct VodGrid: View {
     let items: [VodStream]
     @EnvironmentObject private var session: Session
+    @State private var sort = GridSort.recent
+
+    private var sorted: [VodStream] {
+        switch sort {
+        case .recent: return items
+        case .az: return items.sorted { $0.name.cleanTitle.localizedCaseInsensitiveCompare($1.name.cleanTitle) == .orderedAscending }
+        case .rating: return items.sorted { $0.score > $1.score }
+        case .year: return items.sorted { ($0.year ?? 0) > ($1.year ?? 0) }
+        }
+    }
 
     var body: some View {
         ScrollView {
             LazyVGrid(columns: posterColumns, spacing: 16) {
-                ForEach(items) { v in
+                ForEach(sorted) { v in
                     NavigationLink(value: v) {
                         PosterCell(title: v.name.cleanTitle, image: v.icon,
                                    progress: session.resumeFor(movie: v.name).map { Double($0.pro) / 100 },
@@ -661,6 +727,16 @@ struct VodGrid: View {
                 }
             }
             .padding()
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Picker("Ordenar", selection: $sort) {
+                        ForEach(GridSort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }
+                } label: { Image(systemName: "arrow.up.arrow.down") }
+                .accessibilityLabel("Ordenar")
+            }
         }
     }
 }
@@ -699,6 +775,16 @@ struct MovieDetailView: View {
                             }
                             .buttonStyle(.plain)
                             .padding(.top, 4)
+                        }
+                        let listed = session.inList(Session.listKey(movie: movie.id))
+                        Button { session.toggleList(Session.listKey(movie: movie.id)) } label: {
+                            Label(listed ? "En mi lista" : "Añadir a mi lista", systemImage: listed ? "bookmark.fill" : "bookmark")
+                                .font(.subheadline)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                        if let t = trailerURL(info?.trailer ?? movie.trailer) {
+                            Link(destination: t) { Label("Ver tráiler", systemImage: "play.rectangle").font(.subheadline) }
                         }
                     }
                 }
@@ -756,6 +842,7 @@ struct SeriesView: View {
     /// Series de cada categoría, de la actualizada más reciente a la más antigua.
     @State private var byCategory: [String: [SeriesItem]] = [:]
     @State private var byName: [String: SeriesItem] = [:]
+    @State private var byID: [Int: SeriesItem] = [:]
     @State private var recent: [SeriesItem] = []
     @State private var reloading = false
     @State private var loading = false
@@ -848,6 +935,10 @@ struct SeriesView: View {
                     PosterRail("Seguir viendo", items: cont, width: w, title: { $0.name.cleanTitle }, image: { $0.cover },
                                progress: { s in session.resumeFor(series: s.name).map { Double($0.pro) / 100 } })
                 }
+                let mine = session.watchlist.compactMap { k in k.hasPrefix("s") ? Int(k.dropFirst()).flatMap { byID[$0] } : nil }
+                if !mine.isEmpty {
+                    PosterRail("Mi lista", items: mine, width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
+                }
                 if !recent.isEmpty {
                     PosterRail("Con capítulos nuevos", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
                 }
@@ -888,6 +979,7 @@ struct SeriesView: View {
             counts = cnt
             byCategory = by
             byName = Dictionary(all.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+            byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             recent = Array(newest.prefix(20))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             items = all
@@ -927,16 +1019,52 @@ struct HeroBanner: View {
 
 struct SeriesGrid: View {
     let items: [SeriesItem]
+    @State private var sort = GridSort.recent
+    @State private var genre = ""
+
+    private var genres: [String] {
+        var count: [String: Int] = [:]
+        for s in items { for g in s.genres { count[g, default: 0] += 1 } }
+        return count.filter { $0.value >= 2 }.keys.sorted()
+    }
+
+    private var shown: [SeriesItem] {
+        let list = genre.isEmpty ? items : items.filter { $0.genres.contains(genre) }
+        switch sort {
+        case .recent: return list
+        case .az: return list.sorted { $0.name.cleanTitle.localizedCaseInsensitiveCompare($1.name.cleanTitle) == .orderedAscending }
+        case .rating: return list.sorted { $0.score > $1.score }
+        case .year: return list.sorted { ($0.year ?? 0) > ($1.year ?? 0) }
+        }
+    }
 
     var body: some View {
         ScrollView {
             LazyVGrid(columns: posterColumns, spacing: 16) {
-                ForEach(items) { s in
+                ForEach(shown) { s in
                     NavigationLink(value: s) { PosterCell(title: s.name.cleanTitle, image: s.cover) }
                         .buttonStyle(.plain)
                 }
             }
             .padding()
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Picker("Ordenar", selection: $sort) {
+                        ForEach(GridSort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }
+                    if !genres.isEmpty {
+                        Picker("Género", selection: $genre) {
+                            Text("Todos los géneros").tag("")
+                            ForEach(genres, id: \.self) { Text($0).tag($0) }
+                        }
+                    }
+                } label: {
+                    Image(systemName: genre.isEmpty ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
+                }
+                .accessibilityLabel("Ordenar y filtrar")
+            }
         }
     }
 }
@@ -964,6 +1092,17 @@ struct SeriesDetailView: View {
                         if let p = info?.plot ?? series.plot, !p.isEmpty {
                             Text(p).font(.footnote).foregroundStyle(.secondary).lineLimit(6)
                         }
+                        HStack(spacing: 16) {
+                            let listed = session.inList(Session.listKey(series: series.id))
+                            Button { session.toggleList(Session.listKey(series: series.id)) } label: {
+                                Label(listed ? "En mi lista" : "Mi lista", systemImage: listed ? "bookmark.fill" : "bookmark")
+                            }
+                            .buttonStyle(.borderless)
+                            if let t = trailerURL(series.trailer) {
+                                Link(destination: t) { Label("Tráiler", systemImage: "play.rectangle") }
+                            }
+                        }
+                        .font(.footnote)
                     }
                 }
                 .listRowBackground(Color.clear)
@@ -1092,10 +1231,25 @@ struct SeriesDetailView: View {
 
     private func play(_ ep: Episode, from ms: Int, season forced: Int? = nil) {
         guard let api = session.api else { return }
-        let s = forced ?? seasonOf(ep)
-        playing = PlayItem(url: api.episodeURL(ep), title: series.name.cleanTitle,
-                           subtitle: "T\(s) · E\(ep.number) · \(ep.title.cleanTitle)", startMs: ms,
-                           resume: ResumeTarget(type: "series", name: series.name, itemId: ep.id, season: s, episode: ep.number))
+        playing = Self.episodeItem(series: series, ep: ep, season: forced ?? seasonOf(ep), from: ms, api: api, info: info)
+    }
+
+    /// Lo que se reproduce para un capítulo, con el siguiente ya preparado (siguiente capítulo automático).
+    static func episodeItem(series: SeriesItem, ep: Episode, season s: Int, from ms: Int,
+                            api: XtreamAPI, info: SeriesInfo?) -> PlayItem {
+        var item = PlayItem(url: api.episodeURL(ep), title: series.name.cleanTitle,
+                            subtitle: "T\(s) · E\(ep.number) · \(ep.title.cleanTitle)", startMs: ms,
+                            resume: ResumeTarget(type: "series", name: series.name, itemId: ep.id, season: s, episode: ep.number))
+        if let info, let n = episodeAfter(ep, season: s, in: info) {
+            item.next = { SeriesDetailView.episodeItem(series: series, ep: n.1, season: n.0, from: 0, api: api, info: info) }
+        }
+        return item
+    }
+
+    static func episodeAfter(_ ep: Episode, season s: Int, in info: SeriesInfo) -> (Int, Episode)? {
+        let all: [(Int, Episode)] = info.seasons.flatMap { n in (info.episodes[n] ?? []).map { (n, $0) } }
+        guard let i = all.firstIndex(where: { $0.0 == s && $0.1.id == ep.id }), i + 1 < all.count else { return nil }
+        return all[i + 1]
     }
 }
 
@@ -1143,6 +1297,11 @@ struct ContinueView: View {
         NavigationStack {
             List(session.resume) { item in
                 row(item)
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        Button(role: .destructive) { session.removeResume(item) } label: {
+                            Label("Quitar", systemImage: "trash")
+                        }
+                    }
             }
             .listStyle(.plain)
             .overlay {
@@ -1176,7 +1335,7 @@ struct ContinueView: View {
         let image = series?.cover ?? (item.type == "movie" ? movieIcons[item.name] : nil)
         if let s = series {
             NavigationLink(value: s) { ResumeRow(item: item, image: image) }
-        } else if !item.url.isEmpty, let url = URL(string: item.url) {
+        } else if !item.url.isEmpty, let url = session.playableURL(item.url) {
             Button {
                 playing = PlayItem(url: url, title: item.name.cleanTitle, startMs: item.position,
                                    resume: ResumeTarget(type: item.type, name: item.name, itemId: item.itemId,
@@ -1266,5 +1425,107 @@ struct WebView: UIViewRepresentable {
             context.coordinator.token = reloadToken
             w.reload()
         }
+    }
+}
+
+// MARK: - Buscador global (canales, películas y series a la vez)
+
+struct GlobalSearchView: View {
+    @EnvironmentObject private var session: Session
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var channels: [LiveStream] = []
+    @State private var movies: [VodStream] = []
+    @State private var series: [SeriesItem] = []
+    @State private var loading = true
+    @State private var playing: PlayItem?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if query.count < 2 {
+                    Text(loading ? "Cargando listas…" : "Escribe al menos 2 letras.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    let ch = Array(channels.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(30))
+                    let mv = Array(movies.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(30))
+                    let sr = Array(series.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(30))
+                    if ch.isEmpty && mv.isEmpty && sr.isEmpty {
+                        Text("Sin resultados.").foregroundStyle(.secondary)
+                    }
+                    if !ch.isEmpty {
+                        Section("Canales") {
+                            ForEach(ch) { s in
+                                Button { play(s, in: ch) } label: { ChannelRow(stream: s) }
+                            }
+                        }
+                    }
+                    if !mv.isEmpty {
+                        Section("Películas") {
+                            ForEach(mv) { m in
+                                NavigationLink(value: m) { searchRow(m.name.cleanTitle, m.icon, m.year) }
+                            }
+                        }
+                    }
+                    if !sr.isEmpty {
+                        Section("Series") {
+                            ForEach(sr) { s in
+                                NavigationLink(value: s) { searchRow(s.name.cleanTitle, s.cover, s.year) }
+                            }
+                        }
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("Buscar")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Canal, película o serie")
+            .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
+            .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cerrar") { dismiss() } }
+            }
+        }
+        .task { await load() }
+        .fullScreenCover(item: $playing) { PlayerView(item: $0) }
+    }
+
+    private func searchRow(_ title: String, _ image: String?, _ year: Int?) -> some View {
+        HStack(spacing: 12) {
+            Color.clear
+                .frame(width: 44, height: 66)
+                .overlay { RemoteImage(url: image) }
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).lineLimit(2)
+                if let year { Text(String(year)).font(.caption).foregroundStyle(.secondary) }
+            }
+        }
+    }
+
+    /// Las listas salen de la caché (no se vuelve a descargar nada si ya estaban).
+    @MainActor
+    private func load() async {
+        defer { loading = false }
+        if session.isM3U {
+            channels = (try? await session.m3uChannels()) ?? []
+            return
+        }
+        guard let api = session.api else { return }
+        channels = ((try? await api.liveStreams()) ?? []).filter { !$0.isSeparator }
+        movies = (try? await api.vodStreams()) ?? []
+        series = (try? await api.series()) ?? []
+    }
+
+    private func play(_ s: LiveStream, in list: [LiveStream]) {
+        let api = session.api
+        let urlFor: (LiveStream) -> URL? = { c in c.directURL ?? api?.liveURL(c.id) }
+        guard let url = urlFor(s) else { return }
+        var item = PlayItem(url: url, title: s.name.channelLabel.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
+        let playable = list.filter { urlFor($0) != nil }
+        item.channels = playable
+        item.channelIndex = playable.firstIndex(of: s) ?? 0
+        item.channelURL = { c in urlFor(c)! }
+        playing = item
     }
 }

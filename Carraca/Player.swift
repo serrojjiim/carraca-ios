@@ -1,4 +1,5 @@
 import SwiftUI
+import MediaPlayer
 import MobileVLCKit
 
 struct Track: Identifiable, Hashable {
@@ -16,6 +17,25 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var lengthMs = 0
     @Published var failed = false
     @Published var ended = false
+
+    /// Formato de imagen.
+    enum AspectMode: String, CaseIterable {
+        case fit, fill, wide, classic
+        var title: String {
+            switch self {
+            case .fit: return "Ajustar (original)"
+            case .fill: return "Llenar la pantalla"
+            case .wide: return "16:9"
+            case .classic: return "4:3"
+            }
+        }
+    }
+    @Published var aspect = AspectMode.fit { didSet { applyAspect() } }
+    /// Sincronización (ms; positivo = más tarde).
+    @Published var subtitleDelayMs = 0 { didSet { player.currentVideoSubTitleDelay = subtitleDelayMs * 1000 } }
+    @Published var audioDelayMs = 0 { didSet { player.currentAudioPlaybackDelay = audioDelayMs * 1000 } }
+    /// Idioma/subtítulos preferidos: se aplican una vez por vídeo, al empezar.
+    private var prefsApplied = false
 
     private var url: URL?
     private var live = false
@@ -39,6 +59,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         halted = false
         seekTarget = nil
         failed = false
+        ended = false
+        prefsApplied = false
         buffering = true
         let media = VLCMedia(url: url)
         media.addOption(":network-caching=\(live ? (muted ? 1500 : 2500) : 4000)")
@@ -115,6 +137,51 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         objectWillChange.send()
     }
 
+    /// Ajustes > Reproducción: audio y subtítulos preferidos.
+    private func applyPreferredTracks() {
+        let audioPref = PlaybackPrefs.audio
+        if !audioPref.isEmpty, let t = audioTracks.first(where: { $0.id >= 0 && PlaybackPrefs.matches($0.name, audioPref) }) {
+            setAudio(t.id)
+        }
+        switch PlaybackPrefs.subs {
+        case "": break
+        case "off": setSubtitle(-1)
+        case let pref:
+            if let t = subtitleTracks.first(where: { $0.id >= 0 && PlaybackPrefs.matches($0.name, pref) }) {
+                setSubtitle(t.id)
+            } else if pref == "forzados" {
+                setSubtitle(-1)
+            }
+        }
+    }
+
+    /// Guarda las cadenas C que pide VLC (no las libera mientras las usa).
+    private var aspectCString: UnsafeMutablePointer<CChar>?
+    private var cropCString: UnsafeMutablePointer<CChar>?
+
+    private func applyAspect() {
+        let oldAspect = aspectCString, oldCrop = cropCString
+        aspectCString = nil
+        cropCString = nil
+        switch aspect {
+        case .fit:
+            break
+        case .fill:
+            // recorta el vídeo a la forma de la pantalla (sin bandas negras)
+            let b = UIScreen.main.bounds
+            let w = Int(max(b.width, b.height)), h = Int(min(b.width, b.height))
+            cropCString = strdup("\(w):\(h)")
+        case .wide:
+            aspectCString = strdup("16:9")
+        case .classic:
+            aspectCString = strdup("4:3")
+        }
+        player.videoAspectRatio = aspectCString
+        player.videoCropGeometry = cropCString
+        free(oldAspect)
+        free(oldCrop)
+    }
+
     private func tracks(_ indexes: [Any]?, _ names: [Any]?) -> [Track] {
         let ids = (indexes ?? []).compactMap { ($0 as? NSNumber)?.int32Value }
         let titles = (names ?? []).map { "\($0)" }
@@ -135,6 +202,14 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.buffering = false
                 self.playing = true
                 self.retries = 0
+                if !self.prefsApplied, !self.muted {
+                    self.prefsApplied = true
+                    // las pistas aparecen un instante después de empezar
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.applyPreferredTracks() }
+                    self.applyAspect()
+                    if self.subtitleDelayMs != 0 { self.player.currentVideoSubTitleDelay = self.subtitleDelayMs * 1000 }
+                    if self.audioDelayMs != 0 { self.player.currentAudioPlaybackDelay = self.audioDelayMs * 1000 }
+                }
             case .paused:
                 self.playing = false
             case .error:
@@ -203,7 +278,8 @@ struct VLCVideoView: UIViewRepresentable {
 }
 
 struct PlayerView: View {
-    let item: PlayItem
+    /// Lo que se está reproduciendo (cambia al pasar al siguiente capítulo).
+    @State private var item: PlayItem
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
     @StateObject private var vlc = VLCController()
@@ -213,7 +289,19 @@ struct PlayerView: View {
     @State private var epg: [EPGEntry] = []
     /// Directo: posición del canal actual dentro de item.channels (para anterior/siguiente).
     @State private var channelIndex: Int?
+    @State private var zapWork: DispatchWorkItem?
+    /// Siguiente capítulo: cuenta atrás al acabar.
+    @State private var upNext: PlayItem?
+    @State private var countdown = 10
+    /// Temporizador de apagado.
+    @State private var sleepEnd: Date?
+    @State private var sleepAtEnd = false
     private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+    private let second = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    init(item: PlayItem) {
+        _item = State(initialValue: item)
+    }
 
     private var currentChannel: LiveStream? {
         guard let i = channelIndex, item.channels.indices.contains(i) else { return nil }
@@ -221,6 +309,7 @@ struct PlayerView: View {
     }
     private var title: String { currentChannel?.name.channelLabel.name ?? item.title }
     private var canZap: Bool { item.isLive && item.channels.count > 1 && item.channelURL != nil }
+    private var remainingMs: Int { max(0, vlc.lengthMs - vlc.timeMs) }
 
     var body: some View {
         ZStack {
@@ -240,10 +329,12 @@ struct PlayerView: View {
                     guard canZap, abs(dx) > 80, abs(dx) > abs(dy) * 1.5 else { return }
                     zap(dx < 0 ? 1 : -1)
                 })
-            if vlc.buffering && !vlc.failed {
+            if vlc.buffering && !vlc.failed && upNext == nil {
                 ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false)
             }
-            if vlc.failed {
+            if let next = upNext {
+                upNextCard(next)
+            } else if vlc.failed {
                 failure
             } else if showControls {
                 controls.transition(.opacity)
@@ -256,21 +347,33 @@ struct PlayerView: View {
             setOrientation(.landscape)
             if item.isLive, !item.channels.isEmpty { channelIndex = item.channelIndex }
             vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
+            rememberChannel()
+            setUpRemoteCommands()
             scheduleHide()
         }
         .onDisappear {
             report()
             vlc.stop()
+            tearDownRemoteCommands()
             UIApplication.shared.isIdleTimerDisabled = false
             setOrientation(.portrait)
         }
-        .onReceive(tick) { _ in report() }
+        .onReceive(tick) { _ in
+            report()
+            updateNowPlaying()
+        }
+        .onReceive(second) { _ in secondTick() }
         .onChange(of: vlc.ended) { done in
-            if done {
-                report(final: true)
+            guard done else { return }
+            report(final: true)
+            if !sleepAtEnd, PlaybackPrefs.autoNext, let next = item.next?() {
+                countdown = 10
+                upNext = next
+            } else {
                 dismiss()
             }
         }
+        .onChange(of: vlc.playing) { _ in updateNowPlaying() }
         .task { await loadEPG() }
     }
 
@@ -291,13 +394,21 @@ struct PlayerView: View {
                             .padding(12)
                             .background(.ultraThinMaterial, in: Circle())
                     }
+                    .accessibilityLabel("Cerrar")
                     VStack(alignment: .leading, spacing: 3) {
                         Text(title).font(.headline).lineLimit(1)
                         if let s = item.subtitle { Text(s).font(.subheadline).opacity(0.8).lineLimit(1) }
                         if let now = epg.first { Text("Ahora: \(now.title)").font(.subheadline).lineLimit(1) }
                         if epg.count > 1 { Text("Después: \(epg[1].title)").font(.caption).opacity(0.75).lineLimit(1) }
+                        if let end = sleepEnd {
+                            Label("Se apaga a las \(end.formatted(date: .omitted, time: .shortened))", systemImage: "moon.zzz")
+                                .font(.caption).opacity(0.8)
+                        } else if sleepAtEnd {
+                            Label("Se apaga al terminar", systemImage: "moon.zzz").font(.caption).opacity(0.8)
+                        }
                     }
                     Spacer()
+                    optionsMenu
                     if !vlc.audioTracks.isEmpty || !vlc.subtitleTracks.isEmpty { tracksMenu }
                 }
                 .padding()
@@ -307,16 +418,21 @@ struct PlayerView: View {
                 HStack(spacing: 52) {
                     if !item.isLive {
                         Button { vlc.jump(-10); scheduleHide() } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+                            .accessibilityLabel("Atrasar 10 segundos")
                     } else if canZap {
                         Button { zap(-1) } label: { Image(systemName: "backward.end.fill").font(.system(size: 32)) }
+                            .accessibilityLabel("Canal anterior")
                     }
                     Button { vlc.toggle(); scheduleHide() } label: {
                         Image(systemName: vlc.playing ? "pause.fill" : "play.fill").font(.system(size: 46))
                     }
+                    .accessibilityLabel(vlc.playing ? "Pausa" : "Reproducir")
                     if !item.isLive {
                         Button { vlc.jump(30); scheduleHide() } label: { Image(systemName: "goforward.30").font(.system(size: 34)) }
+                            .accessibilityLabel("Adelantar 30 segundos")
                     } else if canZap {
                         Button { zap(1) } label: { Image(systemName: "forward.end.fill").font(.system(size: 32)) }
+                            .accessibilityLabel("Canal siguiente")
                     }
                 }
 
@@ -332,7 +448,19 @@ struct PlayerView: View {
                     }
                     .padding()
                 } else if vlc.lengthMs > 0 {
-                    seekBar.padding(.horizontal).padding(.bottom, 14)
+                    VStack(alignment: .trailing, spacing: 8) {
+                        // En los créditos: pasar ya al siguiente capítulo.
+                        if item.next != nil, remainingMs < 90_000, remainingMs > 0 {
+                            Button { playNextNow() } label: {
+                                Label("Siguiente capítulo", systemImage: "forward.end.fill")
+                                    .font(.subheadline.bold())
+                                    .padding(.horizontal, 14).padding(.vertical, 8)
+                                    .background(.ultraThinMaterial, in: Capsule())
+                            }
+                        }
+                        seekBar
+                    }
+                    .padding(.horizontal).padding(.bottom, 14)
                 }
             }
             .foregroundStyle(.white)
@@ -349,6 +477,7 @@ struct PlayerView: View {
                     scheduleHide()
                 }
             })
+            .accessibilityLabel("Posición")
             HStack {
                 Text(timeText(scrub.map { Int($0 * Double(vlc.lengthMs)) } ?? vlc.timeMs))
                 Spacer()
@@ -382,12 +511,76 @@ struct PlayerView: View {
                     }
                 }
             }
+            Section("Sincronizar") {
+                Menu("Subtítulos (\(delayText(vlc.subtitleDelayMs)))") {
+                    Button("Adelantar 0,5 s") { vlc.subtitleDelayMs -= 500 }
+                    Button("Retrasar 0,5 s") { vlc.subtitleDelayMs += 500 }
+                    Button("Restablecer") { vlc.subtitleDelayMs = 0 }
+                }
+                Menu("Audio (\(delayText(vlc.audioDelayMs)))") {
+                    Button("Adelantar 0,1 s") { vlc.audioDelayMs -= 100 }
+                    Button("Retrasar 0,1 s") { vlc.audioDelayMs += 100 }
+                    Button("Restablecer") { vlc.audioDelayMs = 0 }
+                }
+            }
         } label: {
             Image(systemName: "captions.bubble")
                 .font(.title3)
                 .padding(12)
                 .background(.ultraThinMaterial, in: Circle())
         }
+        .accessibilityLabel("Audio y subtítulos")
+    }
+
+    /// Formato de imagen y temporizador de apagado.
+    private var optionsMenu: some View {
+        Menu {
+            Section("Imagen") {
+                ForEach(VLCController.AspectMode.allCases, id: \.self) { m in
+                    Button { vlc.aspect = m } label: {
+                        if vlc.aspect == m { Label(m.title, systemImage: "checkmark") } else { Text(m.title) }
+                    }
+                }
+            }
+            Section("Apagar") {
+                ForEach([15, 30, 60, 90], id: \.self) { min in
+                    Button("Dentro de \(min) min") { sleepEnd = Date().addingTimeInterval(Double(min) * 60); sleepAtEnd = false }
+                }
+                if !item.isLive {
+                    Button("Al terminar este capítulo o peli") { sleepAtEnd = true; sleepEnd = nil }
+                }
+                if sleepEnd != nil || sleepAtEnd {
+                    Button("Cancelar temporizador", role: .destructive) { sleepEnd = nil; sleepAtEnd = false }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.title3)
+                .frame(width: 22, height: 22)
+                .padding(12)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .accessibilityLabel("Opciones")
+    }
+
+    private func delayText(_ ms: Int) -> String {
+        ms == 0 ? "0 s" : String(format: "%+.1f s", Double(ms) / 1000).replacingOccurrences(of: ".", with: ",")
+    }
+
+    private func upNextCard(_ next: PlayItem) -> some View {
+        VStack(spacing: 14) {
+            Text("Siguiente capítulo").font(.subheadline).opacity(0.8)
+            Text(next.subtitle ?? next.title).font(.headline).multilineTextAlignment(.center).lineLimit(2)
+            Text("Empieza en \(countdown) s").font(.title2.monospacedDigit().bold())
+            HStack(spacing: 16) {
+                Button("Ver ahora") { playNextNow() }.buttonStyle(.borderedProminent)
+                Button("Cerrar") { upNext = nil; dismiss() }.buttonStyle(.bordered)
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(28)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
+        .padding()
     }
 
     private var failure: some View {
@@ -420,6 +613,31 @@ struct PlayerView: View {
         session.report(item, timeMs: final ? len : vlc.timeMs, lengthMs: len)
     }
 
+    private func secondTick() {
+        if let end = sleepEnd, Date() >= end {
+            sleepEnd = nil
+            dismiss()
+            return
+        }
+        guard upNext != nil else { return }
+        countdown -= 1
+        if countdown <= 0 { playNextNow() }
+    }
+
+    /// Pasa al siguiente capítulo sin salir del reproductor.
+    private func playNextNow() {
+        let next = upNext ?? item.next?()
+        upNext = nil
+        guard let next else { dismiss(); return }
+        if !vlc.ended { report() }
+        item = next
+        epg = []
+        vlc.start(url: next.url, startMs: next.startMs, live: next.isLive)
+        updateNowPlaying()
+        showControls = true
+        scheduleHide()
+    }
+
     /// iPhone: el vídeo se abre en horizontal y al salir se vuelve a vertical (en iPad no se fuerza).
     private func setOrientation(_ mask: UIInterfaceOrientationMask) {
         guard UIDevice.current.userInterfaceIdiom == .phone else { return }
@@ -441,24 +659,90 @@ struct PlayerView: View {
         }
     }
 
-    /// Canal anterior (-1) o siguiente (+1) de la lista desde la que se abrió.
+    /// Canal anterior (-1) o siguiente (+1). El nombre cambia al momento, pero el canal solo se abre
+    /// cuando se deja de cambiar (0,6 s): pasar canales rápido no dispara una ráfaga de conexiones
+    /// (el proveedor banea la IP por eso).
     private func zap(_ step: Int) {
         guard canZap, let i = channelIndex, let urlFor = item.channelURL else { return }
         let n = item.channels.count
         let next = ((i + step) % n + n) % n
         channelIndex = next
         epg = []
-        vlc.start(url: urlFor(item.channels[next]), startMs: 0, live: true)
+        showControls = true
         scheduleHide()
-        Task { await loadEPG() }
+        zapWork?.cancel()
+        let channel = item.channels[next]
+        let work = DispatchWorkItem {
+            vlc.start(url: urlFor(channel), startMs: 0, live: true)
+            rememberChannel()
+            updateNowPlaying()
+            Task { await loadEPG() }
+        }
+        zapWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    private func rememberChannel() {
+        guard item.isLive else { return }
+        if let c = currentChannel { session.lastChannelID = c.id } else if let id = item.liveStreamId { session.lastChannelID = id }
     }
 
     @MainActor
     private func loadEPG() async {
-        guard item.isLive, let api = session.api else { return }
+        guard item.isLive else { return }
+        // Guía del panel (una sola descarga para todos los canales) si la hay.
+        if let c = currentChannel, session.guideEnabled {
+            await session.refreshGuide()
+            let g = session.nowNext(c)
+            if !g.isEmpty {
+                epg = g.map { EPGEntry(title: $0.title, start: $0.start, end: $0.end) }
+                return
+            }
+        }
+        guard let api = session.api else { return }
         // Solo canales Xtream tienen guía (los M3U no traen stream_id del servidor).
         let id = currentChannel.map { $0.directURL == nil ? $0.id : nil } ?? item.liveStreamId
         guard let id else { return }
         epg = (try? await api.shortEPG(id)) ?? []
+    }
+
+    // MARK: Pantalla de bloqueo / Centro de control
+
+    private func setUpRemoteCommands() {
+        let cc = MPRemoteCommandCenter.shared()
+        cc.playCommand.addTarget { _ in vlc.player.play(); return .success }
+        cc.pauseCommand.addTarget { _ in vlc.player.pause(); return .success }
+        cc.togglePlayPauseCommand.addTarget { _ in vlc.toggle(); return .success }
+        if item.isLive {
+            cc.nextTrackCommand.addTarget { _ in zap(1); return .success }
+            cc.previousTrackCommand.addTarget { _ in zap(-1); return .success }
+        } else {
+            cc.skipForwardCommand.preferredIntervals = [30]
+            cc.skipBackwardCommand.preferredIntervals = [10]
+            cc.skipForwardCommand.addTarget { _ in vlc.jump(30); return .success }
+            cc.skipBackwardCommand.addTarget { _ in vlc.jump(-10); return .success }
+        }
+        updateNowPlaying()
+    }
+
+    private func tearDownRemoteCommands() {
+        let cc = MPRemoteCommandCenter.shared()
+        for c in [cc.playCommand, cc.pauseCommand, cc.togglePlayPauseCommand, cc.nextTrackCommand,
+                  cc.previousTrackCommand, cc.skipForwardCommand, cc.skipBackwardCommand] {
+            c.removeTarget(nil)
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+
+    private func updateNowPlaying() {
+        var info: [String: Any] = [MPMediaItemPropertyTitle: title,
+                                   MPNowPlayingInfoPropertyPlaybackRate: vlc.playing ? 1.0 : 0.0,
+                                   MPNowPlayingInfoPropertyIsLiveStream: item.isLive]
+        if let s = item.subtitle { info[MPMediaItemPropertyArtist] = s }
+        if !item.isLive, vlc.lengthMs > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = Double(vlc.lengthMs) / 1000
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(vlc.timeMs) / 1000
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 }
