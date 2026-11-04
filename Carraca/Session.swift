@@ -240,10 +240,16 @@ final class Session: ObservableObject {
         watched.contains(Session.watchKey(series: name, season: season, episode: episode))
     }
 
+    func isWatched(download it: DownloadItem) -> Bool {
+        it.kind == "series" ? isWatched(series: it.resumeName, season: it.season, episode: it.episode)
+                            : isWatched(movie: it.resumeName)
+    }
+
     /// Marcar / desmarcar a mano.
     func setWatched(type: String, name: String, season: Int = 0, episode: Int = 0, on: Bool) {
         let key = type == "series" ? Session.watchKey(series: name, season: season, episode: episode) : Session.watchKey(movie: name)
         if on { watched.insert(key) } else { watched.remove(key) }
+        if on { Downloads.shared.removeWatched(self.isWatched(download:)) }
         guard let user = creds?.user else { return }
         if remoteResume {
             let body: [String: Any] = ["user": user, "action": "visto", "on": on, "type": type, "name": name,

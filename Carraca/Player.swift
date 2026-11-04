@@ -17,6 +17,9 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var lengthMs = 0
     @Published var failed = false
     @Published var ended = false
+    /// Por qué no se ha podido reproducir (se pregunta una vez al servidor, al rendirse).
+    enum FailReason { case checking, generic, busy, blocked, missing, server, offline, file }
+    @Published var failReason = FailReason.generic
 
     /// Formato de imagen.
     enum AspectMode: String, CaseIterable {
@@ -59,6 +62,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         halted = false
         seekTarget = nil
         failed = false
+        failReason = .generic
         ended = false
         prefsApplied = false
         buffering = true
@@ -247,6 +251,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             failed = true
             buffering = false
             playing = false
+            if let url { diagnose(url) }
             return
         }
         retries += 1
@@ -257,6 +262,38 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(3 * retries)) { [weak self] in
             guard let self, !self.halted, self.url == url else { return }
             self.start(url: url, startMs: resumeAt, live: isLive, muted: isMuted)
+        }
+    }
+}
+
+extension VLCController {
+    /// Una sola petición (solo cabeceras, se corta en cuanto responde) para saber qué ha pasado:
+    /// cuenta en uso en otro sitio, IP bloqueada, contenido retirado, servidor caído o sin internet.
+    func diagnose(_ url: URL) {
+        if url.isFileURL { failReason = .file; return }
+        failReason = .checking
+        var req = URLRequest(url: url, timeoutInterval: 8)
+        req.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        req.setValue("CarracaiOS/\(AppConfig.version)", forHTTPHeaderField: "User-Agent")
+        Task { [weak self] in
+            var reason = FailReason.generic
+            do {
+                let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+                bytes.task.cancel()
+                switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
+                case 401, 403, 407, 423, 451: reason = .blocked
+                case 429, 456...462, 509: reason = .busy
+                case 404, 410, 551: reason = .missing
+                case 500...599: reason = .server
+                default: reason = .generic
+                }
+            } catch let e as URLError where [URLError.Code.notConnectedToInternet, .networkConnectionLost, .dataNotAllowed].contains(e.code) {
+                reason = .offline
+            } catch {
+                reason = .generic
+            }
+            let result = reason
+            await MainActor.run { self?.failReason = result }
         }
     }
 }
@@ -296,6 +333,9 @@ struct PlayerView: View {
     /// Temporizador de apagado.
     @State private var sleepEnd: Date?
     @State private var sleepAtEnd = false
+    /// Doble toque a un lado: segundos saltados (se acumulan si se repite), para el aviso en pantalla.
+    @State private var seekFlash = 0
+    @State private var flashWork: DispatchWorkItem?
     private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
     private let second = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -316,19 +356,26 @@ struct PlayerView: View {
             Color.black.ignoresSafeArea()
             VLCVideoView(controller: vlc).ignoresSafeArea()
             // Capa que recibe los toques encima del vídeo (muestra/oculta los controles).
-            Color.clear
-                .contentShape(Rectangle())
-                .ignoresSafeArea()
-                .onTapGesture {
-                    withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
-                    if showControls { scheduleHide() }
-                }
-                // Directo: deslizar a izquierda/derecha cambia de canal.
-                .gesture(DragGesture(minimumDistance: 40).onEnded { v in
-                    let dx = v.translation.width, dy = v.translation.height
-                    guard canZap, abs(dx) > 80, abs(dx) > abs(dy) * 1.5 else { return }
-                    zap(dx < 0 ? 1 : -1)
-                })
+            // Pelis y series: doble toque a la izquierda / derecha = atrasar / adelantar 10 s.
+            GeometryReader { geo in
+                Color.clear
+                    .contentShape(Rectangle())
+                    .modifier(DoubleTapSeek(enabled: !item.isLive) { p in
+                        doubleTapSeek(forward: p.x > geo.size.width / 2)
+                    })
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
+                        if showControls { scheduleHide() }
+                    }
+                    // Directo: deslizar a izquierda/derecha cambia de canal.
+                    .gesture(DragGesture(minimumDistance: 40).onEnded { v in
+                        let dx = v.translation.width, dy = v.translation.height
+                        guard canZap, abs(dx) > 80, abs(dx) > abs(dy) * 1.5 else { return }
+                        zap(dx < 0 ? 1 : -1)
+                    })
+            }
+            .ignoresSafeArea()
+            if seekFlash != 0 { seekFlashView.transition(.opacity) }
             if vlc.buffering && !vlc.failed && upNext == nil {
                 ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false)
             }
@@ -355,6 +402,8 @@ struct PlayerView: View {
         }
         .onDisappear {
             report()
+            // Ajustes > Descargas > Borrar lo ya visto
+            Downloads.shared.removeWatched(session.isWatched(download:))
             vlc.stop()
             tearDownRemoteCommands()
             Downloads.shared.resumeAfterPlayback()
@@ -591,12 +640,48 @@ struct PlayerView: View {
         .padding()
     }
 
+    /// Qué ha pasado, en cristiano (en vez de un "no se ha podido reproducir" para todo).
+    private var failText: (icon: String, title: String, detail: String) {
+        if let exp = session.account?.expDate, exp < Date() {
+            return ("calendar.badge.exclamationmark", "Tu cuenta ha caducado",
+                    "Renueva la suscripción con tu proveedor para seguir viendo.")
+        }
+        switch vlc.failReason {
+        case .busy:
+            return ("person.2.slash", "La cuenta se está usando en otro sitio",
+                    "Tu cuenta solo admite una conexión y ahora mismo está abierta en otro dispositivo (tele, móvil…). Ciérralo y pulsa Reintentar.")
+        case .blocked:
+            return ("hand.raised", "El proveedor ha cortado la conexión",
+                    "Suele pasar tras cambiar muchos canales seguidos o si la cuenta está en uso. Espera unos minutos sin abrir nada y vuelve a probar.")
+        case .missing:
+            return ("film.stack", "No está disponible",
+                    "El proveedor lo ha retirado o no lo tiene ahora mismo.")
+        case .server:
+            return ("server.rack", "El servidor del proveedor está fallando",
+                    "No es cosa de tu conexión. Prueba en unos minutos.")
+        case .offline:
+            return ("wifi.slash", "Sin conexión a internet", "Comprueba el Wi-Fi o los datos móviles.")
+        case .file:
+            return ("exclamationmark.triangle", "No se puede abrir la descarga",
+                    "Puede que el archivo esté incompleto. Bórralo en Descargas y vuelve a descargarlo.")
+        case .checking, .generic:
+            return ("exclamationmark.triangle", "No se ha podido reproducir",
+                    "Puede que no esté disponible ahora mismo. Prueba en unos minutos.")
+        }
+    }
+
     private var failure: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "exclamationmark.triangle").font(.largeTitle)
-            Text("No se ha podido reproducir").font(.headline)
-            Text("Puede que no esté disponible ahora mismo. Prueba en unos minutos.")
-                .font(.subheadline).multilineTextAlignment(.center).opacity(0.8)
+        let f = failText
+        return VStack(spacing: 14) {
+            Image(systemName: f.icon).font(.largeTitle)
+            Text(f.title).font(.headline).multilineTextAlignment(.center)
+            if vlc.failReason == .checking {
+                ProgressView().tint(.white)
+            } else {
+                Text(f.detail)
+                    .font(.subheadline).multilineTextAlignment(.center).opacity(0.8)
+                    .frame(maxWidth: 460)
+            }
             HStack(spacing: 16) {
                 Button("Reintentar") { vlc.restart() }.buttonStyle(.borderedProminent)
                 Button("Cerrar") { dismiss() }.buttonStyle(.bordered)
@@ -606,7 +691,35 @@ struct PlayerView: View {
         .padding(30)
     }
 
+    /// Aviso "−10 s / +20 s" al lado donde se ha tocado.
+    private var seekFlashView: some View {
+        HStack {
+            if seekFlash > 0 { Spacer() }
+            VStack(spacing: 6) {
+                Image(systemName: seekFlash > 0 ? "goforward" : "gobackward").font(.system(size: 30))
+                Text("\(seekFlash > 0 ? "+" : "−")\(abs(seekFlash)) s").font(.headline.monospacedDigit())
+            }
+            .foregroundStyle(.white)
+            .frame(width: 110, height: 110)
+            .background(.ultraThinMaterial, in: Circle())
+            .padding(.horizontal, 70)
+            if seekFlash < 0 { Spacer() }
+        }
+        .allowsHitTesting(false)
+    }
+
     // MARK: Lógica
+
+    private func doubleTapSeek(forward: Bool) {
+        let step = forward ? 10 : -10
+        if (seekFlash > 0) != forward { seekFlash = 0 }
+        withAnimation(.easeOut(duration: 0.12)) { seekFlash += step }
+        vlc.jump(Int32(step))
+        flashWork?.cancel()
+        let w = DispatchWorkItem { withAnimation(.easeIn(duration: 0.25)) { seekFlash = 0 } }
+        flashWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: w)
+    }
 
     private func scheduleHide() {
         hideWork?.cancel()
@@ -752,5 +865,21 @@ struct PlayerView: View {
             info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(vlc.timeMs) / 1000
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+}
+
+/// Doble toque solo donde tiene sentido (en directo no hay nada que adelantar
+/// y así el toque normal no espera a ver si viene otro).
+private struct DoubleTapSeek: ViewModifier {
+    let enabled: Bool
+    let action: (CGPoint) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.onTapGesture(count: 2, coordinateSpace: .local, perform: action)
+        } else {
+            content
+        }
     }
 }

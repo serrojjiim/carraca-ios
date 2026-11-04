@@ -44,7 +44,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String,
                      completionHandler: @escaping () -> Void) {
         Task { @MainActor in
-            Downloads.shared.backgroundCompletion = completionHandler
+            Downloads.shared.backgroundCompletions[identifier] = completionHandler
             _ = Downloads.shared.items     // crea la sesión y se reengancha
         }
     }
@@ -288,6 +288,8 @@ struct SettingsView: View {
     @AppStorage(PlaybackPrefs.audioKey) private var prefAudio = ""
     @AppStorage(PlaybackPrefs.subsKey) private var prefSubs = ""
     @AppStorage(PlaybackPrefs.autoNextKey) private var prefAutoNext = true
+    @AppStorage(DownloadPrefs.wifiOnlyKey) private var wifiOnly = true
+    @AppStorage(DownloadPrefs.autoDeleteKey) private var autoDelete = false
 
     var body: some View {
         NavigationStack {
@@ -343,6 +345,18 @@ struct SettingsView: View {
                     Text("Reproducción")
                 } footer: {
                     Text("Si el vídeo trae ese idioma o subtítulo, se pone solo al empezar.")
+                }
+                Section {
+                    Toggle("Descargar solo con Wi-Fi", isOn: $wifiOnly)
+                        .onChange(of: wifiOnly) { _ in Downloads.shared.networkPolicyChanged() }
+                    Toggle("Borrar lo ya visto", isOn: $autoDelete)
+                        .onChange(of: autoDelete) { on in
+                            if on { Downloads.shared.removeWatched(session.isWatched(download:)) }
+                        }
+                } header: {
+                    Text("Descargas")
+                } footer: {
+                    Text("Con \"solo Wi-Fi\" no se gastan datos móviles: la descarga espera a que haya Wi-Fi. \"Borrar lo ya visto\" libera espacio en cuanto terminas una peli o un capítulo descargado.")
                 }
                 Section {
                     Button("Recargar listas de canales y películas") {

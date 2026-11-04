@@ -1,4 +1,13 @@
 import SwiftUI
+import Network
+
+/// Ajustes > Descargas.
+enum DownloadPrefs {
+    static let wifiOnlyKey = "carraca.pref.wifionly"        // Bool (por defecto true)
+    static let autoDeleteKey = "carraca.pref.autodelete"    // Bool (por defecto false)
+    static var wifiOnly: Bool { UserDefaults.standard.object(forKey: wifiOnlyKey) as? Bool ?? true }
+    static var autoDelete: Bool { UserDefaults.standard.bool(forKey: autoDeleteKey) }
+}
 
 /// Algo descargado (o en cola) para ver sin conexión. Solo se ve dentro de la app (apartado Descargas).
 struct DownloadItem: Codable, Identifiable, Hashable {
@@ -31,13 +40,23 @@ final class Downloads: NSObject, ObservableObject {
     static let shared = Downloads()
 
     @Published private(set) var items: [DownloadItem] = []
+    /// Velocidad de la descarga en curso (bytes/s, suavizada).
+    @Published private(set) var speed: [String: Double] = [:]
+    /// Conectado por Wi-Fi (o cable); si no, con "solo Wi-Fi" la descarga espera.
+    @Published private(set) var onWiFi = true
     /// Pausa automática mientras el reproductor usa la conexión.
     private var pausedForPlayback = false
     private var current: URLSessionDownloadTask?
     private var lastSave = Date.distantPast
-    var backgroundCompletion: (() -> Void)?
+    private var lastSample: (id: String, bytes: Int64, at: Date)?
+    private let monitor = NWPathMonitor()
+    /// iOS despierta la app al acabar una descarga en segundo plano: avisar cuando se haya procesado.
+    var backgroundCompletions: [String: () -> Void] = [:]
 
+    /// Dos sesiones: una que puede usar datos móviles y otra solo Wi-Fi (Ajustes > Descargas).
+    /// Lo bajado se retoma en la otra al cambiar el ajuste, sin perder lo que ya llevaba.
     nonisolated static let sessionID = "com.carraca.smarter.downloads"
+    nonisolated static let wifiSessionID = "com.carraca.smarter.downloads.wifi"
 
     nonisolated static let dir: URL = {
         let u = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -52,14 +71,17 @@ final class Downloads: NSObject, ObservableObject {
     private static var indexFile: URL { dir.appendingPathComponent("descargas.json") }
     private static func resumeFile(_ id: String) -> URL { dir.appendingPathComponent(id + ".resume") }
 
-    private lazy var session: URLSession = {
-        let cfg = URLSessionConfiguration.background(withIdentifier: Self.sessionID)
+    private static func makeSession(_ id: String, cellular: Bool) -> URLSession {
+        let cfg = URLSessionConfiguration.background(withIdentifier: id)
         cfg.sessionSendsLaunchEvents = true
         cfg.isDiscretionary = false
         cfg.httpMaximumConnectionsPerHost = 1
-        cfg.allowsCellularAccess = true
+        cfg.allowsCellularAccess = cellular
         return URLSession(configuration: cfg, delegate: DownloadDelegate.shared, delegateQueue: nil)
-    }()
+    }
+    private lazy var cellSession = Self.makeSession(Self.sessionID, cellular: true)
+    private lazy var wifiSession = Self.makeSession(Self.wifiSessionID, cellular: false)
+    private var session: URLSession { DownloadPrefs.wifiOnly ? wifiSession : cellSession }
 
     override init() {
         super.init()
@@ -67,15 +89,25 @@ final class Downloads: NSObject, ObservableObject {
            let list = try? JSONDecoder().decode([DownloadItem].self, from: d) {
             items = list
         }
+        monitor.pathUpdateHandler = { [weak self] path in
+            let wifi = path.status == .satisfied && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
+            Task { @MainActor in self?.onWiFi = wifi }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
         // reengancharse a la tarea que siguiera en marcha si la app se cerró
-        session.getAllTasks { tasks in
-            Task { @MainActor in
+        Task { @MainActor in
+            var running: URLSessionDownloadTask?
+            for s in [self.cellSession, self.wifiSession] {
+                let tasks = await s.allTasks
                 if let t = tasks.compactMap({ $0 as? URLSessionDownloadTask }).first(where: { $0.state == .running }) {
-                    self.current = t
-                } else {
-                    for i in self.items.indices where self.items[i].state == .downloading { self.items[i].state = .queued }
-                    self.startNext()
+                    running = t
                 }
+            }
+            if let running {
+                self.current = running
+            } else {
+                for i in self.items.indices where self.items[i].state == .downloading { self.items[i].state = .queued }
+                self.startNext()
             }
         }
     }
@@ -83,6 +115,24 @@ final class Downloads: NSObject, ObservableObject {
     // MARK: Consultas
 
     func item(_ id: String) -> DownloadItem? { items.first { $0.id == id } }
+
+    /// Con "solo Wi-Fi" y sin Wi-Fi, la descarga en curso está esperando.
+    var waitingForWiFi: Bool { DownloadPrefs.wifiOnly && !onWiFi }
+
+    /// "12,4 MB/s · quedan 8 min"
+    func rateText(_ it: DownloadItem) -> String? {
+        guard let v = speed[it.id], v > 1 else { return nil }
+        var s = byteText(Int64(v)) + "/s"
+        if it.total > it.received {
+            let secs = Double(it.total - it.received) / v
+            let f = DateComponentsFormatter()
+            f.unitsStyle = .abbreviated
+            f.allowedUnits = secs >= 3600 ? [.hour, .minute] : secs >= 60 ? [.minute] : [.second]
+            f.maximumUnitCount = 2
+            if let t = f.string(from: max(1, secs)) { s += " · quedan " + t }
+        }
+        return s
+    }
     func fileURL(_ it: DownloadItem) -> URL { Self.dir.appendingPathComponent(it.fileName) }
     var bytesUsed: Int64 { items.filter { $0.state == .done }.reduce(0) { $0 + $1.total } }
     var freeBytes: Int64 {
@@ -110,8 +160,33 @@ final class Downloads: NSObject, ObservableObject {
         }
     }
 
+    /// Ajustes > Descargas: borrar solas las descargas ya vistas (al terminar de verlas).
+    func removeWatched(_ isWatched: (DownloadItem) -> Bool) {
+        guard DownloadPrefs.autoDelete else { return }
+        for it in items where it.state == .done && isWatched(it) { remove(it.id) }
+    }
+
+    /// Ha cambiado "solo Wi-Fi": la descarga en curso sigue en la sesión que toca, desde donde iba.
+    func networkPolicyChanged() {
+        guard let i = items.firstIndex(where: { $0.state == .downloading }), let task = current else {
+            startNext()
+            return
+        }
+        let id = items[i].id
+        current = nil
+        items[i].state = .queued
+        speed[id] = nil
+        task.cancel(byProducingResumeData: { data in
+            Task { @MainActor in
+                if let data { try? data.write(to: Self.resumeFile(id)) }
+                self.startNext()
+            }
+        })
+    }
+
     func pause(_ id: String) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        speed[id] = nil
         if items[i].state == .downloading {
             current?.cancel(byProducingResumeData: { data in
                 Task { @MainActor in if let data { try? data.write(to: Self.resumeFile(id)) } }
@@ -139,6 +214,7 @@ final class Downloads: NSObject, ObservableObject {
         })
         current = nil
         items[i].state = .queued
+        speed[id] = nil
         pausedForPlayback = true
         save(force: true)
     }
@@ -168,6 +244,7 @@ final class Downloads: NSObject, ObservableObject {
         }
         task.taskDescription = it.id
         items[i].state = .downloading
+        lastSample = nil
         current = task
         task.resume()
         save(force: true)
@@ -180,11 +257,24 @@ final class Downloads: NSObject, ObservableObject {
         items[i].received = received
         if total > 0 { items[i].total = total }
         if items[i].state != .downloading { items[i].state = .downloading }
+        // velocidad: media suave de lo bajado por segundo
+        let now = Date()
+        if let s = lastSample, s.id == id, received >= s.bytes {
+            let dt = now.timeIntervalSince(s.at)
+            if dt >= 1 {
+                let inst = Double(received - s.bytes) / dt
+                speed[id] = speed[id].map { $0 * 0.7 + inst * 0.3 } ?? inst
+                lastSample = (id, received, now)
+            }
+        } else {
+            lastSample = (id, received, now)
+        }
         save()
     }
 
     func finished(_ id: String, ok: Bool, resumeData: Data?) {
         current = nil
+        speed[id] = nil
         if let i = items.firstIndex(where: { $0.id == id }) {
             if ok {
                 items[i].state = .done
@@ -240,9 +330,9 @@ final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        let id = session.configuration.identifier ?? ""
         Task { @MainActor in
-            Downloads.shared.backgroundCompletion?()
-            Downloads.shared.backgroundCompletion = nil
+            Downloads.shared.backgroundCompletions.removeValue(forKey: id)?()
         }
     }
 }
@@ -387,6 +477,7 @@ struct DownloadsList: View {
             }
         }
         .listStyle(.insetGrouped)
+        .onAppear { downloads.removeWatched(session.isWatched(download:)) }
         .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
     }
 
@@ -407,8 +498,13 @@ struct DownloadsList: View {
                     case .downloading:
                         ProgressView(value: it.progress).tint(.accentColor)
                         Text("\(byteText(it.received)) de \(byteText(it.total))").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        if downloads.waitingForWiFi {
+                            Label("Esperando Wi-Fi", systemImage: "wifi.exclamationmark").font(.caption2).foregroundStyle(.orange)
+                        } else if let r = downloads.rateText(it) {
+                            Text(r).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        }
                     case .queued:
-                        Text("En cola").font(.caption).foregroundStyle(.secondary)
+                        Text(downloads.waitingForWiFi ? "En cola · esperando Wi-Fi" : "En cola").font(.caption).foregroundStyle(.secondary)
                     case .paused:
                         Text("En pausa · \(Int(it.progress * 100)) %").font(.caption).foregroundStyle(.secondary)
                     case .failed:

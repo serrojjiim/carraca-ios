@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import Security
 
 // MARK: - Configuración
@@ -383,11 +384,13 @@ struct SeriesInfo: Decodable {
     var episodes: [Int: [Episode]] = [:]
     var plot: String?
     var cover: String?
+    /// Imagen horizontal grande (fondo de la ficha).
+    var backdrop: String?
 
     var seasons: [Int] { episodes.keys.sorted() }
 
     enum CodingKeys: String, CodingKey { case episodes, info }
-    enum InfoKeys: String, CodingKey { case plot, cover }
+    enum InfoKeys: String, CodingKey { case plot, cover, backdrop_path }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -399,6 +402,8 @@ struct SeriesInfo: Decodable {
         if let i = try? c.nestedContainer(keyedBy: InfoKeys.self, forKey: .info) {
             plot = i.flexString(.plot)
             cover = i.flexString(.cover)
+            let bd = (try? i.decodeIfPresent([String].self, forKey: .backdrop_path))?.first ?? i.flexString(.backdrop_path)
+            backdrop = bd.flatMap { $0.hasPrefix("http") ? $0 : nil }
         }
     }
 }
@@ -672,8 +677,15 @@ final class XtreamAPI: @unchecked Sendable {
     func get<T: Decodable>(_ type: T.Type, _ action: String?, _ extra: [String: String] = [:],
                            cache: String? = nil, maxAge: TimeInterval = 0, force: Bool = false) async throws -> T {
         let key = cache.map { cachePrefix + "_" + $0 }
-        if let key, !force, maxAge > 0, let data = DiskCache.read(key, maxAge: maxAge),
-           let value = try? JSONDecoder().decode(T.self, from: data) {
+        // 1) en memoria: las listas grandes (12.000 pelis) ya decodificadas, para no leerlas
+        //    y decodificarlas de nuevo en cada pantalla (Películas, Seguir viendo, Buscar, Descargas…)
+        if let key, !force, maxAge > 0, let value: T = MemCache.shared.get(key, maxAge: maxAge) {
+            return value
+        }
+        // 2) en disco
+        if let key, !force, maxAge > 0, let hit = DiskCache.readDated(key, maxAge: maxAge),
+           let value = try? JSONDecoder().decode(T.self, from: hit.0) {
+            MemCache.shared.set(key, value, at: hit.1)
             return value
         }
         do {
@@ -681,7 +693,10 @@ final class XtreamAPI: @unchecked Sendable {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard code == 200 else { throw APIError.http(code) }
             guard let value = try? JSONDecoder().decode(T.self, from: data) else { throw APIError.badResponse }
-            if let key { DiskCache.write(key, data) }
+            if let key {
+                DiskCache.write(key, data)
+                if maxAge > 0 { MemCache.shared.set(key, value, at: Date()) }
+            }
             return value
         } catch {
             // Sin red o el servidor falla: mejor la lista que ya teníamos (aunque sea vieja) que una pantalla de error.
@@ -752,11 +767,17 @@ enum DiskCache {
     }
 
     static func read(_ key: String, maxAge: TimeInterval) -> Data? {
+        readDated(key, maxAge: maxAge)?.0
+    }
+
+    /// Los datos y cuándo se guardaron.
+    static func readDated(_ key: String, maxAge: TimeInterval) -> (Data, Date)? {
         let f = file(key)
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: f.path),
               let mod = attrs[.modificationDate] as? Date,
-              Date().timeIntervalSince(mod) < maxAge else { return nil }
-        return try? Data(contentsOf: f)
+              Date().timeIntervalSince(mod) < maxAge,
+              let data = try? Data(contentsOf: f) else { return nil }
+        return (data, mod)
     }
 
     static func write(_ key: String, _ data: Data) {
@@ -764,8 +785,77 @@ enum DiskCache {
     }
 
     static func clear() {
+        MemCache.shared.clear()
         try? FileManager.default.removeItem(at: dir)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+}
+
+/// Caché en memoria de lo ya decodificado (caduca a la vez que la copia en disco).
+/// Si iOS avisa de poca memoria, se vacía y se vuelve a leer del disco cuando haga falta.
+final class MemCache: @unchecked Sendable {
+    static let shared = MemCache()
+    private let lock = NSLock()
+    private var items: [String: (value: Any, at: Date)] = [:]
+
+    private init() {
+        NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification,
+                                               object: nil, queue: nil) { [weak self] _ in self?.clear() }
+    }
+
+    func get<T>(_ key: String, maxAge: TimeInterval) -> T? {
+        lock.lock(); defer { lock.unlock() }
+        guard let e = items[key], Date().timeIntervalSince(e.at) < maxAge else { return nil }
+        return e.value as? T
+    }
+
+    func set(_ key: String, _ value: Any, at: Date) {
+        lock.lock(); defer { lock.unlock() }
+        items[key] = (value, at)
+    }
+
+    func clear() {
+        lock.lock(); defer { lock.unlock() }
+        items.removeAll()
+    }
+}
+
+// MARK: - Búsqueda
+
+extension String {
+    /// Para buscar: sin mayúsculas ni tildes ("Acción" = "accion").
+    var searchKey: String { folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil) }
+}
+
+/// Índice de búsqueda: los nombres se normalizan una sola vez al cargar la lista (no en cada letra)
+/// y se busca por palabras en cualquier orden; primero lo que empieza por lo escrito.
+struct SearchIndex<T> {
+    private var keys: [String] = []
+    private var items: [T] = []
+
+    init() {}
+    init(_ list: [T], name: (T) -> String) {
+        items = list
+        keys = list.map { name($0).searchKey }
+    }
+
+    var isEmpty: Bool { items.isEmpty }
+
+    func search(_ query: String, limit: Int) -> [T] {
+        let words = query.searchKey.split(separator: " ").map(String.init)
+        guard let first = words.first else { return [] }
+        var starts: [T] = [], others: [T] = []
+        for i in keys.indices {
+            let k = keys[i]
+            guard words.allSatisfy({ k.contains($0) }) else { continue }
+            if k.hasPrefix(first) {
+                starts.append(items[i])
+                if starts.count >= limit { break }
+            } else if others.count < limit {
+                others.append(items[i])
+            }
+        }
+        return Array((starts + others).prefix(limit))
     }
 }
 

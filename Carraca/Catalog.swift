@@ -13,6 +13,8 @@ struct LiveView: View {
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
+    @State private var index = SearchIndex<LiveStream>()
+    @State private var hits: [LiveStream] = []
     @State private var playing: PlayItem?
     /// "Recargar listas" de Ajustes en curso (pantalla de cargando encima).
     @State private var reloading = false
@@ -40,6 +42,7 @@ struct LiveView: View {
         }
         .overlay { if reloading { ReloadingOverlay() } }
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
+        .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
     }
 
     /// iPad: categorías a la izquierda; canales (con vista previa) a la derecha.
@@ -221,7 +224,7 @@ struct LiveView: View {
     }
 
     private var results: some View {
-        let list = Array(streams.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300))
+        let list = hits
         return List(list) { s in
             Button { play(s, in: list) } label: { ChannelRow(stream: s) }
                 .favoriteActions(s)
@@ -268,6 +271,7 @@ struct LiveView: View {
             logos = lg
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             streams = all
+            index = await makeSearchIndex(all) { $0.name }
             error = nil
         } catch {
             self.error = error.localizedDescription
@@ -567,6 +571,8 @@ struct MoviesView: View {
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
+    @State private var index = SearchIndex<VodStream>()
+    @State private var hits: [VodStream] = []
 
     /// iPad: categoría elegida en el menú lateral (Inicio = filas de carátulas).
     @State private var selected: Category? = Category.home
@@ -576,6 +582,7 @@ struct MoviesView: View {
             if hsize == .regular { splitBody } else { stackBody }
         }
         .task { if movies.isEmpty { await load() } }
+        .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
         .onChange(of: session.reloadToken) { _ in
             Task {
                 reloading = true
@@ -594,7 +601,7 @@ struct MoviesView: View {
         } else if movies.isEmpty, let error {
             ErrorView(message: error) { Task { await load(force: true) } }
         } else if !query.isEmpty {
-            VodGrid(items: Array(movies.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
+            VodGrid(items: hits)
         } else {
             home
         }
@@ -705,6 +712,7 @@ struct MoviesView: View {
             top = Array(newest.prefix(600).filter { $0.score >= 6.5 && $0.score < 10 }.sorted { $0.score > $1.score }.prefix(20))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             movies = all
+            index = await makeSearchIndex(all) { $0.name }
             error = nil
         } catch {
             self.error = error.localizedDescription
@@ -935,6 +943,8 @@ struct SeriesView: View {
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
+    @State private var index = SearchIndex<SeriesItem>()
+    @State private var hits: [SeriesItem] = []
 
     /// iPad: categoría elegida en el menú lateral (Inicio = filas de carátulas).
     @State private var selected: Category? = Category.home
@@ -944,6 +954,7 @@ struct SeriesView: View {
             if hsize == .regular { splitBody } else { stackBody }
         }
         .task { if items.isEmpty { await load() } }
+        .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
         .onChange(of: session.reloadToken) { _ in
             Task {
                 reloading = true
@@ -962,7 +973,7 @@ struct SeriesView: View {
         } else if items.isEmpty, let error {
             ErrorView(message: error) { Task { await load(force: true) } }
         } else if !query.isEmpty {
-            SeriesGrid(items: Array(items.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(300)))
+            SeriesGrid(items: hits)
         } else {
             home
         }
@@ -1070,6 +1081,7 @@ struct SeriesView: View {
             recent = Array(newest.prefix(20))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             items = all
+            index = await makeSearchIndex(all) { $0.name }
             error = nil
         } catch {
             self.error = error.localizedDescription
@@ -1167,32 +1179,10 @@ struct SeriesDetailView: View {
     var body: some View {
         List {
             Section {
-                HStack(alignment: .top, spacing: 14) {
-                    Color.clear
-                        .aspectRatio(2.0 / 3.0, contentMode: .fit)
-                        .frame(width: 110)
-                        .overlay { RemoteImage(url: series.cover ?? info?.cover) }
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(series.name.cleanTitle).font(.title3.bold())
-                        if let g = series.genre, !g.isEmpty { Text(g).font(.subheadline).foregroundStyle(.secondary) }
-                        if let p = info?.plot ?? series.plot, !p.isEmpty {
-                            Text(p).font(.footnote).foregroundStyle(.secondary).lineLimit(6)
-                        }
-                        HStack(spacing: 16) {
-                            let listed = session.inList(Session.listKey(series: series.id))
-                            Button { session.toggleList(Session.listKey(series: series.id)) } label: {
-                                Label(listed ? "En mi lista" : "Mi lista", systemImage: listed ? "bookmark.fill" : "bookmark")
-                            }
-                            .buttonStyle(.borderless)
-                            if let t = trailerURL(series.trailer) {
-                                Link(destination: t) { Label("Tráiler", systemImage: "play.rectangle") }
-                            }
-                        }
-                        .font(.footnote)
-                    }
-                }
-                .listRowBackground(Color.clear)
+                header
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
 
                 if let r = session.resumeFor(series: series.name), let ep = episode(season: r.season, number: r.episode) {
                     Button { play(ep, from: r.position, season: r.season) } label: {
@@ -1264,9 +1254,70 @@ struct SeriesDetailView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(Color("LaunchBg").ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
         .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
+    }
+
+    /// Fondo grande (imagen horizontal o carátula desenfocada) con la carátula y los datos encima.
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Color.clear
+                .frame(height: 210)
+                .overlay {
+                    if let b = series.backdrop ?? info?.backdrop {
+                        RemoteImage(url: b, maxPixel: 1400)
+                    } else {
+                        RemoteImage(url: series.cover ?? info?.cover).blur(radius: 28).opacity(0.7)
+                    }
+                }
+                .overlay {
+                    LinearGradient(colors: [.clear, Color("LaunchBg").opacity(0.6), Color("LaunchBg")],
+                                   startPoint: .top, endPoint: .bottom)
+                }
+                .clipped()
+            HStack(alignment: .top, spacing: 16) {
+                Color.clear
+                    .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                    .frame(width: 120)
+                    .overlay { RemoteImage(url: series.cover ?? info?.cover) }
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(series.name.cleanTitle).font(.title3.bold())
+                    if let g = series.genre, !g.isEmpty { Text(g).font(.subheadline).foregroundStyle(.secondary) }
+                    if let n = info?.seasons.count, n > 0 {
+                        Text(n == 1 ? "1 temporada" : "\(n) temporadas").font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    if let r = series.rating, let v = Double(r), v > 0 {
+                        Label(String(format: "%.1f", v), systemImage: "star.fill").font(.subheadline).foregroundStyle(.yellow)
+                    }
+                    HStack(spacing: 16) {
+                        let listed = session.inList(Session.listKey(series: series.id))
+                        Button { session.toggleList(Session.listKey(series: series.id)) } label: {
+                            Label(listed ? "En mi lista" : "Mi lista", systemImage: listed ? "bookmark.fill" : "bookmark")
+                        }
+                        .buttonStyle(.borderless)
+                        if let t = trailerURL(series.trailer) {
+                            Link(destination: t) { Label("Tráiler", systemImage: "play.rectangle") }
+                        }
+                    }
+                    .font(.subheadline)
+                    .padding(.top, 2)
+                }
+                .padding(.top, 74)
+            }
+            .padding(.horizontal, 4)
+            .padding(.top, -90)
+            if let p = info?.plot ?? series.plot, !p.isEmpty {
+                Text(p).font(.footnote).foregroundStyle(.secondary).lineLimit(8)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 14)
+            }
+        }
+        .padding(.bottom, 6)
     }
 
     @MainActor
@@ -1381,24 +1432,51 @@ struct EpisodeRow: View {
     let progress: Double?
     var watched = false
 
+    private var thumb: String? { episode.image.flatMap { $0.hasPrefix("http") ? $0 : nil } }
+
     var body: some View {
         HStack(spacing: 12) {
-            Group {
-                if watched {
-                    Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(.green)
-                } else {
-                    Text("\(episode.number)").font(.headline.monospacedDigit()).foregroundStyle(Color.accentColor)
+            if let thumb {
+                // Fotograma del capítulo, con el progreso abajo y una marca si ya está visto.
+                Color.clear
+                    .frame(width: 112, height: 63)
+                    .overlay { RemoteImage(url: thumb, maxPixel: 360) }
+                    .overlay {
+                        if watched {
+                            Color.black.opacity(0.45)
+                            Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(.green)
+                        }
+                    }
+                    .overlay(alignment: .bottom) {
+                        if let progress {
+                            GeometryReader { g in
+                                ZStack(alignment: .leading) {
+                                    Rectangle().fill(Color.black.opacity(0.5))
+                                    Rectangle().fill(Color.accentColor).frame(width: g.size.width * progress)
+                                }
+                            }
+                            .frame(height: 4)
+                        }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            } else {
+                Group {
+                    if watched {
+                        Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(.green)
+                    } else {
+                        Text("\(episode.number)").font(.headline.monospacedDigit()).foregroundStyle(Color.accentColor)
+                    }
                 }
+                .frame(width: 34)
             }
-            .frame(width: 34)
             VStack(alignment: .leading, spacing: 4) {
-                Text(watched ? "\(episode.number). \(episode.title.cleanTitle)" : episode.title.cleanTitle)
+                Text(thumb != nil || watched ? "\(episode.number). \(episode.title.cleanTitle)" : episode.title.cleanTitle)
                     .lineLimit(2)
                     .foregroundStyle(watched ? Color.secondary : Color.primary)
                 if let d = episode.durationSecs, d > 0 {
                     Text("\(d / 60) min").font(.caption).foregroundStyle(.secondary)
                 }
-                if let progress { ProgressView(value: progress).tint(.accentColor) }
+                if thumb == nil, let progress { ProgressView(value: progress).tint(.accentColor) }
             }
             Spacer()
             Image(systemName: "play.circle").foregroundStyle(Color.accentColor)
@@ -1572,9 +1650,12 @@ struct GlobalSearchView: View {
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
-    @State private var channels: [LiveStream] = []
-    @State private var movies: [VodStream] = []
-    @State private var series: [SeriesItem] = []
+    @State private var chIndex = SearchIndex<LiveStream>()
+    @State private var mvIndex = SearchIndex<VodStream>()
+    @State private var srIndex = SearchIndex<SeriesItem>()
+    @State private var ch: [LiveStream] = []
+    @State private var mv: [VodStream] = []
+    @State private var sr: [SeriesItem] = []
     @State private var loading = true
     @State private var playing: PlayItem?
 
@@ -1585,9 +1666,6 @@ struct GlobalSearchView: View {
                     Text(loading ? "Cargando listas…" : "Escribe al menos 2 letras.")
                         .foregroundStyle(.secondary)
                 } else {
-                    let ch = Array(channels.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(30))
-                    let mv = Array(movies.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(30))
-                    let sr = Array(series.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(30))
                     if ch.isEmpty && mv.isEmpty && sr.isEmpty {
                         Text("Sin resultados.").foregroundStyle(.secondary)
                     }
@@ -1625,6 +1703,15 @@ struct GlobalSearchView: View {
             }
         }
         .task { await load() }
+        .task(id: query) {
+            guard query.count >= 2 else { ch = []; mv = []; sr = []; return }
+            // espera a que se deje de escribir (no buscar en 20.000 títulos por cada letra)
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            ch = chIndex.search(query, limit: 30)
+            mv = mvIndex.search(query, limit: 30)
+            sr = srIndex.search(query, limit: 30)
+        }
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
     }
 
@@ -1646,13 +1733,23 @@ struct GlobalSearchView: View {
     private func load() async {
         defer { loading = false }
         if session.isM3U {
-            channels = (try? await session.m3uChannels()) ?? []
+            let list = (try? await session.m3uChannels()) ?? []
+            chIndex = await makeSearchIndex(list) { $0.name }
             return
         }
         guard let api = session.api else { return }
-        channels = ((try? await api.liveStreams()) ?? []).filter { !$0.isSeparator }
-        movies = (try? await api.vodStreams()) ?? []
-        series = (try? await api.series()) ?? []
+        let channels = ((try? await api.liveStreams()) ?? []).filter { !$0.isSeparator }
+        let movies = (try? await api.vodStreams()) ?? []
+        let series = (try? await api.series()) ?? []
+        chIndex = await makeSearchIndex(channels) { $0.name }
+        mvIndex = await makeSearchIndex(movies) { $0.name }
+        srIndex = await makeSearchIndex(series) { $0.name }
+        // si ya había algo escrito mientras cargaba
+        if query.count >= 2 {
+            ch = chIndex.search(query, limit: 30)
+            mv = mvIndex.search(query, limit: 30)
+            sr = srIndex.search(query, limit: 30)
+        }
     }
 
     private func play(_ s: LiveStream, in list: [LiveStream]) {
@@ -1666,4 +1763,20 @@ struct GlobalSearchView: View {
         item.channelURL = { c in urlFor(c)! }
         playing = item
     }
+}
+
+/// Prepara el índice fuera del hilo principal (no bloquea la pantalla con 12.000 títulos).
+func makeSearchIndex<T>(_ list: [T], _ name: (T) -> String) async -> SearchIndex<T> {
+    SearchIndex(list, name: name)
+}
+
+/// Búsqueda con espera: solo se busca cuando se deja de escribir un momento.
+/// nil si se ha seguido escribiendo (se mantienen los resultados de antes, sin parpadeos).
+@MainActor
+func debouncedSearch<T>(_ query: String, in index: SearchIndex<T>, limit: Int) async -> [T]? {
+    let q = query.trimmingCharacters(in: .whitespaces)
+    guard !q.isEmpty else { return [] }
+    try? await Task.sleep(nanoseconds: 250_000_000)
+    if Task.isCancelled { return nil }
+    return index.search(q, limit: limit)
 }
