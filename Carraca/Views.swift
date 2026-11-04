@@ -264,6 +264,13 @@ struct MainTabView: View {
     @Environment(\.requestReview) private var requestReview
     /// Pestaña en la que se estaba (al volver a abrir la app se sigue ahí).
     @SceneStorage("carraca.tab") private var tab = "live"
+    @Environment(\.horizontalSizeClass) private var hsize
+
+    /// iPad a pantalla ancha con iPadOS 18 o posterior: barra de pestañas arriba → avisos abajo.
+    private var bannersAtBottom: Bool {
+        guard #available(iOS 18, *) else { return false }
+        return UIDevice.current.userInterfaceIdiom == .pad && hsize == .regular
+    }
 
     private var tabs: [String] {
         var t = ["live"]
@@ -287,10 +294,25 @@ struct MainTabView: View {
                 SportsView().tabItem { Label("Eventos", systemImage: "sportscourt") }.tag("events")
             }
         }
+        // iPad (iPadOS 18+): las pestañas van arriba, flotando; un aviso arriba las tapaba.
+        // Ahí los avisos van abajo, como una tarjeta que empuja el contenido (no tapa nada).
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 0) {
-                ExpiryBanner()
-                SeasonBanner()
+            if !bannersAtBottom {
+                VStack(spacing: 0) {
+                    ExpiryBanner()
+                    SeasonBanner()
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if bannersAtBottom {
+                VStack(spacing: 6) {
+                    ExpiryBanner().clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    SeasonBanner(edge: .bottom).clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+                .frame(maxWidth: 640)
+                .padding(.horizontal, 16).padding(.bottom, 8)
+                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
             }
         }
         .task {

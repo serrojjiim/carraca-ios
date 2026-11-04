@@ -8,7 +8,7 @@ import SwiftUI
 // Sin conexión se usa la última copia guardada (y las fechas se miran en el propio iPhone).
 
 struct SeasonTheme: Equatable {
-    enum Motion { case snow, fall, flutter, confetti, sparkle }
+    enum Motion: String { case snow, fall, flutter, confetti, sparkle, off }
 
     let id: String
     let name: String
@@ -31,6 +31,14 @@ extension UIColor {
     convenience init(hex: UInt32) {
         self.init(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
                   blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+    }
+
+    /// "#RRGGBB" (o "RRGGBB") del panel. nil si no es un color.
+    convenience init?(hexString s: String) {
+        var h = s.trimmingCharacters(in: .whitespaces)
+        if h.hasPrefix("#") { h.removeFirst() }
+        guard h.count == 6, let v = UInt32(h, radix: 16) else { return nil }
+        self.init(hex: v)
     }
 }
 
@@ -107,8 +115,10 @@ struct ThemeConfig: Decodable {
     var effects = 2
     var texts: [String: Texts] = [:]
     var calendar: [Span] = []
+    /// Temas creados en el panel ("Crear tema"): el diseño entero viene en el JSON.
+    var custom: [String: SeasonTheme] = [:]
 
-    enum CodingKeys: String, CodingKey { case modo, fijo, fijo_hasta, efectos, temas, calendario }
+    enum CodingKeys: String, CodingKey { case modo, fijo, fijo_hasta, efectos, temas, calendario, custom }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -138,6 +148,45 @@ struct ThemeConfig: Decodable {
                 calendar.append(Span(id: id, from: a, to: b))
             }
         }
+        if let list = try? c.decode([String: JSONValue].self, forKey: .custom) {
+            for (id, v) in list {
+                guard case .object(let o) = v, let t = Self.customTheme(id: id, o) else { continue }
+                custom[id] = t
+            }
+        }
+    }
+
+    /// {"nombre", "emoji", "acento": "#RRGGBB", "colores": ["#…", "#…"], "efecto", "caen": ["🎉", …]}
+    private static func customTheme(id: String, _ o: [String: JSONValue]) -> SeasonTheme? {
+        func str(_ k: String) -> String? { if case .string(let s)? = o[k] { return s }; return nil }
+        func strs(_ k: String) -> [String] {
+            guard case .array(let a)? = o[k] else { return [] }
+            return a.compactMap { v -> String? in
+                if case .string(let s) = v { return s }
+                return nil
+            }
+        }
+        guard let accent = str("acento").flatMap(UIColor.init(hexString:)) else { return nil }
+        var colors = strs("colores").compactMap(UIColor.init(hexString:)).map { Color(uiColor: $0) }
+        if colors.isEmpty { colors = [Color(uiColor: accent)] }
+        if colors.count == 1 { colors.append(colors[0]) }
+        let motion: SeasonTheme.Motion
+        switch str("efecto") ?? "" {
+        case "snow": motion = .snow
+        case "fall": motion = .fall
+        case "fly": motion = .flutter
+        case "confetti": motion = .confetti
+        case "rise": motion = .sparkle
+        default: motion = .off
+        }
+        // Lo que cae: emojis cortos (un emoji puede ocupar varios "caracteres" de Swift si lleva tono, etc.)
+        let symbols = Array(strs("caen").map { String($0.prefix(2)) }.filter { !$0.isEmpty }.prefix(8))
+        let name = String((str("nombre") ?? "Tema").prefix(30))
+        return SeasonTheme(id: id, name: name,
+                           emoji: String((str("emoji") ?? "✨").prefix(2)), accentUI: accent,
+                           colors: Array(colors.prefix(2)), symbols: symbols,
+                           motion: (motion == .fall || motion == .flutter) && symbols.isEmpty ? .snow : motion,
+                           message: "", railTitle: "Especial " + name, keywords: [])
     }
 
     static let day: DateFormatter = {
@@ -204,7 +253,7 @@ final class ThemeStore: ObservableObject {
     }
 
     private func recompute() {
-        var t = config?.activeID(on: Date()).flatMap { SeasonTheme.catalog[$0] }
+        var t = config?.activeID(on: Date()).flatMap { SeasonTheme.catalog[$0] ?? config?.custom[$0] }
         if var x = t, let o = config?.texts[x.id] {
             if let m = o.message { x.message = m }
             if let r = o.rail, !r.isEmpty { x.railTitle = r }
@@ -273,6 +322,8 @@ struct SeasonBanner: View {
     @ObservedObject private var theme = ThemeStore.shared
     @AppStorage("carraca.tema.cerrado") private var closed = ""
     @AppStorage(ThemeStore.decorKey) private var decor = true
+    /// Por dónde entra / sale (arriba en iPhone; abajo en iPad, donde las pestañas van arriba).
+    var edge: Edge = .top
 
     var body: some View {
         if decor, let t = theme.current, !t.message.isEmpty, closed != theme.bannerKey {
@@ -288,7 +339,7 @@ struct SeasonBanner: View {
             .foregroundStyle(.white)
             .padding(.leading, 14).padding(.trailing, 8).padding(.vertical, 7)
             .background(LinearGradient(colors: t.colors, startPoint: .leading, endPoint: .trailing))
-            .transition(.move(edge: .top).combined(with: .opacity))
+            .transition(.move(edge: edge).combined(with: .opacity))
         }
     }
 }
@@ -309,7 +360,7 @@ struct SeasonDecor: View {
                 LinearGradient(colors: [t.colors[0].opacity(0.30), t.colors[t.colors.count - 1].opacity(0.10), .clear],
                                startPoint: .top, endPoint: .bottom)
                     .frame(height: 260)
-                if !reduceMotion && !ProcessInfo.processInfo.isLowPowerModeEnabled {
+                if t.motion != .off && !reduceMotion && !ProcessInfo.processInfo.isLowPowerModeEnabled {
                     ParticleField(theme: t, count: theme.effects >= 2 ? 24 : 11,
                                   paused: theme.paused || phase != .active)
                 }
@@ -425,6 +476,8 @@ struct ParticleField: View {
                     ctx.fill(Path(ellipseIn: CGRect(x: x - d * 0.22, y: y - d * 0.3, width: d * 0.18, height: d * 0.18)),
                              with: .color(.white.opacity(op)))
                 }
+            case .off:
+                return
             }
         }
     }
