@@ -82,6 +82,8 @@ struct CarracaApp: App {
 struct RootView: View {
     @EnvironmentObject private var session: Session
     @EnvironmentObject private var store: Store
+    @ObservedObject private var theme = ThemeStore.shared
+    @Environment(\.scenePhase) private var phase
 
     var body: some View {
         Group {
@@ -94,6 +96,13 @@ struct RootView: View {
             } else {
                 PaywallView()
             }
+        }
+        .overlay { SeasonDecor() }
+        .animation(.easeInOut(duration: 0.4), value: theme.current?.id)
+        .seasonTint()
+        .task { await ThemeStore.shared.refresh(force: true) }
+        .onChange(of: phase) { p in
+            if p == .active { Task { await ThemeStore.shared.refresh() } }
         }
         .onOpenURL { session.handle(url: $0) }
         .alert("Nueva versión disponible",
@@ -117,6 +126,7 @@ struct LoginView: View {
     }
 
     @EnvironmentObject private var session: Session
+    @ObservedObject private var theme = ThemeStore.shared
     @State private var mode = Mode.xtream
     @State private var server = ""
     @State private var user = ""
@@ -133,7 +143,7 @@ struct LoginView: View {
                     .scaledToFit()
                     .frame(height: 120)
                     .padding(.top, 56)
-                Text("Carraca").font(.largeTitle.bold())
+                Text("Carraca" + (theme.current.map { " " + $0.emoji } ?? "")).font(.largeTitle.bold())
 
                 Picker("Tipo", selection: $mode) {
                     ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
@@ -252,22 +262,37 @@ struct LoginView: View {
 struct MainTabView: View {
     @EnvironmentObject private var session: Session
     @Environment(\.requestReview) private var requestReview
+    /// Pestaña en la que se estaba (al volver a abrir la app se sigue ahí).
+    @SceneStorage("carraca.tab") private var tab = "live"
+
+    private var tabs: [String] {
+        var t = ["live"]
+        if !session.isM3U { t += ["movies", "series"] }
+        if session.resumeEnabled { t.append("continue") }
+        if session.showsEvents { t.append("events") }
+        return t
+    }
 
     var body: some View {
-        TabView {
-            LiveView().tabItem { Label("Directo", systemImage: "tv") }
+        TabView(selection: Binding(get: { tabs.contains(tab) ? tab : "live" }, set: { tab = $0 })) {
+            LiveView().tabItem { Label("Directo", systemImage: "tv") }.tag("live")
             if !session.isM3U {
-                MoviesView().tabItem { Label("Películas", systemImage: "film") }
-                SeriesView().tabItem { Label("Series", systemImage: "rectangle.stack.badge.play") }
+                MoviesView().tabItem { Label("Películas", systemImage: "film") }.tag("movies")
+                SeriesView().tabItem { Label("Series", systemImage: "rectangle.stack.badge.play") }.tag("series")
             }
             if session.resumeEnabled {
-                ContinueView().tabItem { Label("Seguir", systemImage: "clock.arrow.circlepath") }
+                ContinueView().tabItem { Label("Seguir", systemImage: "clock.arrow.circlepath") }.tag("continue")
             }
             if session.showsEvents {
-                SportsView().tabItem { Label("Eventos", systemImage: "sportscourt") }
+                SportsView().tabItem { Label("Eventos", systemImage: "sportscourt") }.tag("events")
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { ExpiryBanner() }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                ExpiryBanner()
+                SeasonBanner()
+            }
+        }
         .task {
             // Al abrir (no en mitad de un vídeo): unos segundos después de entrar.
             guard ReviewPrompt.shouldAsk else { return }
@@ -290,6 +315,8 @@ struct SettingsView: View {
     @AppStorage(PlaybackPrefs.autoNextKey) private var prefAutoNext = true
     @AppStorage(DownloadPrefs.wifiOnlyKey) private var wifiOnly = true
     @AppStorage(DownloadPrefs.autoDeleteKey) private var autoDelete = false
+    @AppStorage(ThemeStore.decorKey) private var decor = true
+    @ObservedObject private var theme = ThemeStore.shared
 
     var body: some View {
         NavigationStack {
@@ -359,6 +386,16 @@ struct SettingsView: View {
                     Text("Con \"solo Wi-Fi\" no se gastan datos móviles: la descarga espera a que haya Wi-Fi. \"Borrar lo ya visto\" libera espacio en cuanto terminas una peli o un capítulo descargado.")
                 }
                 Section {
+                    if let t = theme.current {
+                        LabeledContent("Tema de temporada", value: "\(t.emoji) \(t.name)")
+                    }
+                    Toggle("Decoración de temporada", isOn: $decor)
+                } header: {
+                    Text("Apariencia")
+                } footer: {
+                    Text("Carraca se viste para Navidad, Halloween, Carnaval y cada estación: color, nieve u hojas cayendo y una fila especial de pelis. Quita la decoración si prefieres la pantalla limpia.")
+                }
+                Section {
                     Button("Recargar listas de canales y películas") {
                         DiskCache.clear()
                         session.reloadToken += 1
@@ -381,6 +418,7 @@ struct SettingsView: View {
                 }
             }
             .manageSubscriptionsSheet(isPresented: $manage)
+            .seasonTint()
             .navigationTitle("Ajustes")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

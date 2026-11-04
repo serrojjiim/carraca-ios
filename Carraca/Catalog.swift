@@ -10,6 +10,10 @@ struct LiveView: View {
     @State private var counts: [String: Int] = [:]
     /// Logos de los primeros canales de cada categoría (carátula de la tarjeta).
     @State private var logos: [String: [String]] = [:]
+    /// Canales de cada categoría, por id y favoritos: calculados al cargar (no en cada repintado).
+    @State private var byCategory: [String: [LiveStream]] = [:]
+    @State private var byID: [Int: LiveStream] = [:]
+    @State private var favs: [LiveStream] = []
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
@@ -43,6 +47,7 @@ struct LiveView: View {
         .overlay { if reloading { ReloadingOverlay() } }
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
         .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
+        .onChange(of: session.favorites) { _ in favs = streams.filter { session.isFavorite($0) } }
     }
 
     /// iPad: categorías a la izquierda; canales (con vista previa) a la derecha.
@@ -104,8 +109,8 @@ struct LiveView: View {
     /// "Seguir viendo · <último canal>" (abre el canal con su categoría para poder cambiar).
     @ViewBuilder
     private var lastChannelButton: some View {
-        if query.isEmpty, let id = session.lastChannelID, let ch = streams.first(where: { $0.id == id }) {
-            Button { play(ch, in: streams.filter { $0.categoryId == ch.categoryId }) } label: {
+        if query.isEmpty, let id = session.lastChannelID, let ch = byID[id] {
+            Button { play(ch, in: byCategory[ch.categoryId] ?? [ch]) } label: {
                 HStack(spacing: 12) {
                     RemoteImage(url: ch.icon, contentMode: .fit)
                         .frame(width: 52, height: 34)
@@ -183,7 +188,7 @@ struct LiveView: View {
                 }
                 NavigationLink(value: Category.all) {
                     CategoryCard(name: "Todos los canales", tag: nil, count: streams.count,
-                                 logos: streams.compactMap(\.icon).prefix(4).map { $0 }, symbol: "square.grid.2x2")
+                                 logos: Array(streams.lazy.compactMap(\.icon).prefix(4)), symbol: "square.grid.2x2")
                 }
                 .buttonStyle(.plain)
                 ForEach(categories) { c in
@@ -235,8 +240,8 @@ struct LiveView: View {
     private func channels(in cat: Category) -> [LiveStream] {
         switch cat.id {
         case Category.all.id: return streams
-        case Category.favorites.id: return streams.filter { session.isFavorite($0) }
-        default: return streams.filter { $0.categoryId == cat.id }
+        case Category.favorites.id: return favs
+        default: return byCategory[cat.id] ?? []
         }
     }
 
@@ -263,12 +268,17 @@ struct LiveView: View {
             let all = loaded.filter { !$0.isSeparator }
             var cnt: [String: Int] = [:]
             var lg: [String: [String]] = [:]
+            var by: [String: [LiveStream]] = [:]
             for s in all {
                 cnt[s.categoryId, default: 0] += 1
+                by[s.categoryId, default: []].append(s)
                 if let i = s.icon, (lg[s.categoryId]?.count ?? 0) < 4 { lg[s.categoryId, default: []].append(i) }
             }
             counts = cnt
             logos = lg
+            byCategory = by
+            byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            favs = all.filter { session.isFavorite($0) }
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             streams = all
             index = await makeSearchIndex(all) { $0.name }
@@ -419,7 +429,7 @@ struct ChannelListView: View {
     }
 
     private var filtered: [LiveStream] {
-        query.isEmpty ? channels : channels.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        query.isEmpty ? channels : channels.filter { $0.name.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil }
     }
 
     private func range(_ e: EPGEntry) -> String {
@@ -446,6 +456,15 @@ struct ChannelListView: View {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled, selected == s, playing == nil, let item = makeItem(s, [s]) else { return }
             preview.start(url: item.url, startMs: 0, live: true, muted: true)
+            // con guía del panel no hace falta preguntar al proveedor (una petición menos por canal)
+            if session.guideEnabled {
+                await session.refreshGuide()
+                let g = session.nowNext(s)
+                if !g.isEmpty {
+                    if selected == s { epg = g.map { EPGEntry(title: $0.title, start: $0.start, end: $0.end) } }
+                    return
+                }
+            }
             guard let id = item.liveStreamId, let api = session.api else { return }
             let list = (try? await api.shortEPG(id)) ?? []
             if selected == s { epg = list }
@@ -567,6 +586,11 @@ struct MoviesView: View {
     @State private var recent: [VodStream] = []
     @State private var top: [VodStream] = []
     @State private var byID: [Int: VodStream] = [:]
+    /// Todas, de la más nueva a la más antigua, y nombre de cada categoría (para la fila del tema).
+    @State private var newestAll: [VodStream] = []
+    @State private var catNames: [String: String] = [:]
+    @State private var seasonal: [VodStream] = []
+    @ObservedObject private var theme = ThemeStore.shared
     @State private var reloading = false
     @State private var loading = false
     @State private var error: String?
@@ -583,6 +607,7 @@ struct MoviesView: View {
         }
         .task { if movies.isEmpty { await load() } }
         .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
+        .task(id: theme.current) { await updateSeasonal() }
         .onChange(of: session.reloadToken) { _ in
             Task {
                 reloading = true
@@ -661,6 +686,11 @@ struct MoviesView: View {
                     PosterRail("Mi lista", items: mine, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
                 }
+                if let t = theme.current, seasonal.count >= 3 {
+                    PosterRail("\(t.emoji) \(t.railTitle)", seeAll: t.railCategory, count: seasonal.count,
+                               items: Array(seasonal.prefix(20)), width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                               watched: { session.isWatched(movie: $0.name) })
+                }
                 if !recent.isEmpty {
                     PosterRail("Recién añadidas", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
@@ -680,6 +710,21 @@ struct MoviesView: View {
             .padding(.vertical)
         }
         .refreshable { await load(force: true) }
+    }
+
+    /// "Especial Navidad", "Noche de miedo"…: pelis cuyo título o categoría encaja con el tema.
+    @MainActor
+    private func updateSeasonal() async {
+        guard let t = theme.current, !newestAll.isEmpty else {
+            seasonal = []
+            byCategory[SeasonTheme.railCategoryID] = nil
+            return
+        }
+        let names = catNames
+        let picks = await seasonalPicks(newestAll, keywords: t.keywords,
+                                        text: { $0.name + " " + (names[$0.categoryId] ?? "") }, limit: 300)
+        seasonal = picks
+        byCategory[SeasonTheme.railCategoryID] = picks
     }
 
     /// Lo que se dejó a medias (de "Seguir viendo"), como carátulas.
@@ -711,8 +756,11 @@ struct MoviesView: View {
             // Mejor nota entre las ~600 más recientes (en el catálogo antiguo hay notas sin sentido).
             top = Array(newest.prefix(600).filter { $0.score >= 6.5 && $0.score < 10 }.sorted { $0.score > $1.score }.prefix(20))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
+            catNames = Dictionary(cats.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+            newestAll = newest
             movies = all
             index = await makeSearchIndex(all) { $0.name }
+            await updateSeasonal()
             error = nil
         } catch {
             self.error = error.localizedDescription
@@ -939,6 +987,10 @@ struct SeriesView: View {
     @State private var byName: [String: SeriesItem] = [:]
     @State private var byID: [Int: SeriesItem] = [:]
     @State private var recent: [SeriesItem] = []
+    @State private var newestAll: [SeriesItem] = []
+    @State private var catNames: [String: String] = [:]
+    @State private var seasonal: [SeriesItem] = []
+    @ObservedObject private var theme = ThemeStore.shared
     @State private var reloading = false
     @State private var loading = false
     @State private var error: String?
@@ -955,6 +1007,7 @@ struct SeriesView: View {
         }
         .task { if items.isEmpty { await load() } }
         .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
+        .task(id: theme.current) { await updateSeasonal() }
         .onChange(of: session.reloadToken) { _ in
             Task {
                 reloading = true
@@ -1037,6 +1090,10 @@ struct SeriesView: View {
                 if !mine.isEmpty {
                     PosterRail("Mi lista", items: mine, width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
                 }
+                if let t = theme.current, seasonal.count >= 3 {
+                    PosterRail("\(t.emoji) \(t.railTitle)", seeAll: t.railCategory, count: seasonal.count,
+                               items: Array(seasonal.prefix(20)), width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
+                }
                 if !recent.isEmpty {
                     PosterRail("Con capítulos nuevos", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
                 }
@@ -1050,6 +1107,22 @@ struct SeriesView: View {
             .padding(.vertical)
         }
         .refreshable { await load(force: true) }
+    }
+
+    /// Series cuyo título, género o categoría encaja con el tema de temporada.
+    @MainActor
+    private func updateSeasonal() async {
+        guard let t = theme.current, !newestAll.isEmpty else {
+            seasonal = []
+            byCategory[SeasonTheme.railCategoryID] = nil
+            return
+        }
+        let names = catNames
+        let picks = await seasonalPicks(newestAll, keywords: t.keywords,
+                                        text: { $0.name + " " + ($0.genre ?? "") + " " + (names[$0.categoryId] ?? "") },
+                                        limit: 300)
+        seasonal = picks
+        byCategory[SeasonTheme.railCategoryID] = picks
     }
 
     private var continuing: [SeriesItem] {
@@ -1080,8 +1153,11 @@ struct SeriesView: View {
             byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             recent = Array(newest.prefix(20))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
+            catNames = Dictionary(cats.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+            newestAll = newest
             items = all
             index = await makeSearchIndex(all) { $0.name }
+            await updateSeasonal()
             error = nil
         } catch {
             self.error = error.localizedDescription
@@ -1702,6 +1778,7 @@ struct GlobalSearchView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cerrar") { dismiss() } }
             }
         }
+        .seasonTint()
         .task { await load() }
         .task(id: query) {
             guard query.count >= 2 else { ch = []; mv = []; sr = []; return }

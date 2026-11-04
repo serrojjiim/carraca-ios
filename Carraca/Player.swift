@@ -387,9 +387,12 @@ struct PlayerView: View {
                 controls.transition(.opacity)
             }
         }
+        .background(keyboardShortcuts)
+        .seasonTint()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .onAppear {
+            ThemeStore.shared.paused = true      // la decoración de temporada no se ve: que no gaste
             UIApplication.shared.isIdleTimerDisabled = true
             setOrientation(.landscape)
             if item.isLive, !item.channels.isEmpty { channelIndex = item.channelIndex }
@@ -407,6 +410,7 @@ struct PlayerView: View {
             vlc.stop()
             tearDownRemoteCommands()
             Downloads.shared.resumeAfterPlayback()
+            ThemeStore.shared.paused = false
             UIApplication.shared.isIdleTimerDisabled = false
             setOrientation(.portrait)
         }
@@ -706,6 +710,33 @@ struct PlayerView: View {
             if seekFlash < 0 { Spacer() }
         }
         .allowsHitTesting(false)
+    }
+
+    /// Teclado (iPad con teclado, Mac): espacio = pausa, ← → = 10 s (en directo, canal),
+    /// ↑ ↓ = 1 min (en directo, canal), Esc = cerrar.
+    private var keyboardShortcuts: some View {
+        ZStack {
+            Button("Pausa") { vlc.toggle(); showControlsBriefly() }
+                .keyboardShortcut(.space, modifiers: [])
+            Button("Atrás") { item.isLive ? zap(-1) : doubleTapSeek(forward: false) }
+                .keyboardShortcut(.leftArrow, modifiers: [])
+            Button("Adelante") { item.isLive ? zap(1) : doubleTapSeek(forward: true) }
+                .keyboardShortcut(.rightArrow, modifiers: [])
+            Button("Subir") { if item.isLive { zap(-1) } else { vlc.jump(60); showControlsBriefly() } }
+                .keyboardShortcut(.upArrow, modifiers: [])
+            Button("Bajar") { if item.isLive { zap(1) } else { vlc.jump(-60); showControlsBriefly() } }
+                .keyboardShortcut(.downArrow, modifiers: [])
+            Button("Cerrar") { dismiss() }
+                .keyboardShortcut(.escape, modifiers: [])
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .accessibilityHidden(true)
+    }
+
+    private func showControlsBriefly() {
+        withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
+        scheduleHide()
     }
 
     // MARK: Lógica

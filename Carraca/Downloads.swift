@@ -48,6 +48,9 @@ final class Downloads: NSObject, ObservableObject {
     private var pausedForPlayback = false
     private var current: URLSessionDownloadTask?
     private var lastSave = Date.distantPast
+    /// El progreso se enseña como mucho 2 veces por segundo (iOS avisa cientos de veces):
+    /// cada aviso repintaba todas las pantallas que miran las descargas.
+    private var lastUI = Date.distantPast
     private var lastSample: (id: String, bytes: Int64, at: Date)?
     private let monitor = NWPathMonitor()
     /// iOS despierta la app al acabar una descarga en segundo plano: avisar cuando se haya procesado.
@@ -253,12 +256,14 @@ final class Downloads: NSObject, ObservableObject {
     // MARK: Desde el delegado
 
     func progress(_ id: String, received: Int64, total: Int64) {
-        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        let now = Date()
+        guard let i = items.firstIndex(where: { $0.id == id }),
+              now.timeIntervalSince(lastUI) >= 0.5 || items[i].state != .downloading else { return }
+        lastUI = now
         items[i].received = received
         if total > 0 { items[i].total = total }
         if items[i].state != .downloading { items[i].state = .downloading }
         // velocidad: media suave de lo bajado por segundo
-        let now = Date()
         if let s = lastSample, s.id == id, received >= s.bytes {
             let dt = now.timeIntervalSince(s.at)
             if dt >= 1 {
@@ -301,10 +306,15 @@ final class Downloads: NSObject, ObservableObject {
 /// Delegado de la sesión en segundo plano (fuera del hilo principal).
 final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     static let shared = DownloadDelegate()
+    /// Último aviso pasado a la pantalla por tarea (la cola del delegado es en serie: sin carreras).
+    private var lastSent: [Int: Date] = [:]
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let id = downloadTask.taskDescription else { return }
+        let now = Date()
+        if let last = lastSent[downloadTask.taskIdentifier], now.timeIntervalSince(last) < 0.4 { return }
+        lastSent[downloadTask.taskIdentifier] = now
         Task { @MainActor in Downloads.shared.progress(id, received: totalBytesWritten, total: totalBytesExpectedToWrite) }
     }
 
@@ -402,6 +412,7 @@ struct DownloadOptionsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cerrar") { dismiss() } } }
         }
+        .seasonTint()
         .task { await load() }
     }
 

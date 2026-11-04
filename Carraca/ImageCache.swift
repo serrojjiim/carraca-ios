@@ -42,8 +42,12 @@ actor ImageLoader {
     }
 
     private static func load(_ url: URL, key: String, maxPixel: Int) async -> UIImage? {
-        let file = dir.appendingPathComponent(key + ".jpg")
+        // ".img": PNG si tiene transparencia (logos de canales), JPG si no. Antes todo iba en JPG
+        // y los logos transparentes salían con un recuadro negro (y los oscuros, invisibles).
+        let file = dir.appendingPathComponent(key + ".img")
         if let d = try? Data(contentsOf: file), let img = UIImage(data: d) {
+            // en uso: que la limpieza de 30 días no se lo lleve
+            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
             return await img.byPreparingForDisplay() ?? img
         }
         guard let res = try? await URLSession.shared.data(from: url),
@@ -53,7 +57,11 @@ actor ImageLoader {
         let scale = min(1, CGFloat(maxPixel) / max(img.size.width * img.scale, img.size.height * img.scale))
         let target = CGSize(width: img.size.width * img.scale * scale, height: img.size.height * img.scale * scale)
         let small = (scale < 1 ? await img.byPreparingThumbnail(ofSize: target) : await img.byPreparingForDisplay()) ?? img
-        if let jpg = small.jpegData(compressionQuality: 0.85) { try? jpg.write(to: file, options: .atomic) }
+        let opaque: [CGImageAlphaInfo] = [CGImageAlphaInfo.none, .noneSkipFirst, .noneSkipLast]
+        let alpha = small.cgImage.map { !opaque.contains($0.alphaInfo) } ?? false
+        if let data = alpha ? small.pngData() : small.jpegData(compressionQuality: 0.85) {
+            try? data.write(to: file, options: .atomic)
+        }
         return small
     }
 
@@ -72,6 +80,8 @@ actor ImageLoader {
             let limit = Date().addingTimeInterval(-30 * 86_400)
             let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
             for f in files {
+                // las copias viejas en JPG (sin transparencia) ya no se usan
+                if f.pathExtension == "jpg" { try? fm.removeItem(at: f); continue }
                 let d = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
                 if d < limit { try? fm.removeItem(at: f) }
             }
