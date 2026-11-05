@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 import AVFoundation
 import StoreKit
 
@@ -32,8 +33,11 @@ enum ReviewPrompt {
 }
 
 /// Controla qué orientaciones permite la app en cada momento (el reproductor fuerza horizontal en iPhone).
-final class AppDelegate: NSObject, UIApplicationDelegate {
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     static var orientationLock: UIInterfaceOrientationMask = .allButUpsideDown
+    /// Pestaña que abrir al tocar un aviso (si la app aún no tenía las pestañas en pantalla).
+    static var pendingTab: String?
+    static let openTab = Notification.Name("carraca.openTab")
 
     func application(_ application: UIApplication,
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
@@ -52,7 +56,26 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         Task { @MainActor in _ = Downloads.shared.items }   // retoma descargas pendientes
+        UNUserNotificationCenter.current().delegate = self
         return true
+    }
+
+    /// Aviso de un evento con la app abierta: se enseña igual.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound, .list])
+    }
+
+    /// Tocar el aviso: a la pestaña de Eventos.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let tab = response.notification.request.content.userInfo["tab"] as? String {
+            DispatchQueue.main.async {
+                Self.pendingTab = tab
+                NotificationCenter.default.post(name: Self.openTab, object: tab)
+            }
+        }
+        completionHandler()
     }
 }
 
@@ -66,7 +89,8 @@ struct CarracaApp: App {
         ReviewPrompt.countLaunch()
         ImageLoader.trim()
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        URLCache.shared = URLCache(memoryCapacity: 64 << 20, diskCapacity: 400 << 20)
+        // las imágenes van por su propia caché (ImageLoader); esta queda para lo demás
+        URLCache.shared = URLCache(memoryCapacity: 16 << 20, diskCapacity: 50 << 20)
     }
 
     var body: some Scene {
@@ -291,7 +315,7 @@ struct MainTabView: View {
                 ContinueView().tabItem { Label("Seguir", systemImage: "clock.arrow.circlepath") }.tag("continue")
             }
             if session.showsEvents {
-                SportsView().tabItem { Label("Eventos", systemImage: "sportscourt") }.tag("events")
+                EventsView().tabItem { Label("Eventos", systemImage: "sportscourt") }.tag("events")
             }
         }
         // iPad (iPadOS 18+): las pestañas van arriba, flotando; un aviso arriba las tapaba.
@@ -314,6 +338,12 @@ struct MainTabView: View {
                 .padding(.horizontal, 16).padding(.bottom, 8)
                 .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
             }
+        }
+        .onAppear {
+            if let t = AppDelegate.pendingTab { tab = t; AppDelegate.pendingTab = nil }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AppDelegate.openTab)) { n in
+            if let t = n.object as? String { tab = t; AppDelegate.pendingTab = nil }
         }
         .task {
             // Al abrir (no en mitad de un vídeo): unos segundos después de entrar.
@@ -481,30 +511,79 @@ struct RemoteImage: View {
     var contentMode: ContentMode = .fill
     /// Tamaño máximo (px) al que se guarda: pósteres y logos pequeños, fondos más grandes.
     var maxPixel = 480
+    /// Carátulas: si no hay imagen (o no carga) se pinta una tarjeta con el título.
+    var title: String? = nil
     @State private var image: UIImage?
+    @State private var failed = false
 
     var body: some View {
         ZStack {
             if let image {
                 Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
                     .transition(.opacity)
+            } else if let title, failed || url == nil {
+                TitleTile(title: title)
             } else {
                 placeholder
             }
         }
         .task(id: url) {
-            guard let s = url, let u = URL(string: s) else { image = nil; return }
+            failed = false
+            guard let s = url, let u = URL(string: s) else { image = nil; failed = true; return }
             if let m = ImageLoader.shared.cached(u, maxPixel: maxPixel) { image = m; return }
             image = nil
             let loaded = await ImageLoader.shared.image(u, maxPixel: maxPixel)
-            withAnimation(.easeIn(duration: 0.15)) { image = loaded }
+            if Task.isCancelled { return }
+            withAnimation(.easeIn(duration: 0.15)) {
+                image = loaded
+                failed = loaded == nil
+            }
         }
     }
 
     private var placeholder: some View {
         Rectangle()
             .fill(Color.white.opacity(0.06))
-            .overlay(Image(systemName: "photo").foregroundStyle(.tertiary))
+            .overlay {
+                if let title {
+                    Text(title)
+                        .font(.caption2.weight(.semibold))
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.white.opacity(0.35))
+                        .lineLimit(4)
+                        .padding(8)
+                } else {
+                    Image(systemName: "photo").foregroundStyle(.tertiary)
+                }
+            }
+    }
+}
+
+/// Carátula que falta: degradado (color sacado del título, siempre el mismo) con el título.
+struct TitleTile: View {
+    let title: String
+
+    private var hue: Double {
+        let h = title.unicodeScalars.reduce(UInt32(5381)) { ($0 &<< 5) &+ $0 &+ $1.value }
+        return Double(h % 360) / 360
+    }
+
+    var body: some View {
+        LinearGradient(colors: [Color(hue: hue, saturation: 0.55, brightness: 0.42),
+                                Color(hue: hue, saturation: 0.65, brightness: 0.18)],
+                       startPoint: .topLeading, endPoint: .bottomTrailing)
+            .overlay {
+                VStack(spacing: 8) {
+                    Image(systemName: "film").font(.title3).opacity(0.5)
+                    Text(title)
+                        .font(.footnote.weight(.bold))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(5)
+                        .minimumScaleFactor(0.7)
+                }
+                .foregroundStyle(.white.opacity(0.92))
+                .padding(10)
+            }
     }
 }
 
@@ -518,7 +597,7 @@ struct PosterCell: View {
         VStack(alignment: .leading, spacing: 6) {
             Color.clear
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
-                .overlay { RemoteImage(url: image) }
+                .overlay { RemoteImage(url: image, title: title) }
                 .overlay(alignment: .bottom) {
                     if let progress {
                         ProgressView(value: progress).tint(.accentColor).padding(6)
@@ -850,7 +929,7 @@ struct VodSidebar: View {
             Label("Inicio", systemImage: "house").tag(Category.home)
             Section("Categorías") {
                 ForEach(categories) { c in
-                    let l = c.name.categoryLabel
+                    let l = c.label
                     HStack(spacing: 6) {
                         Text(l.name).lineLimit(1)
                         if let t = l.tag { TagChip(text: t) }

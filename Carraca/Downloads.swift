@@ -446,7 +446,7 @@ struct DownloadOptionsView: View {
 
     private func start(_ v: MovieVersion) {
         guard let api = session.api else { return }
-        downloads.enqueue(DownloadItem(id: "m\(movie.id)", kind: "movie", title: movie.name.cleanTitle,
+        downloads.enqueue(DownloadItem(id: "m\(movie.id)", kind: "movie", title: movie.title,
                                        image: movie.icon, remote: api.movieURL(v.movie).absoluteString,
                                        ext: v.movie.ext, resumeName: movie.name, itemId: String(movie.id),
                                        total: v.bytes))

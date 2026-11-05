@@ -9,9 +9,8 @@ enum AppConfig {
     static let panel = "https://carracaservice.duckdns.org"
     static var configURL: URL { URL(string: panel + "/config.json")! }
     static var resumeURL: URL { URL(string: panel + "/resume.php")! }
-    static var sportsURL: URL { URL(string: panel + "/deportes_html.php")! }
-    /// Respaldo por si config.json no responde.
-    static let fallbackServer = "http://82.165.142.230"
+    /// Agenda de deportes del día (texto plano que genera el panel; la pestaña Eventos la pinta en nativo).
+    static var sportsURL: URL { URL(string: panel + "/deportes.txt")! }
 
     static var build: Int { Int(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "") ?? 0 }
     static var version: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "" }
@@ -37,6 +36,38 @@ struct RemoteConfig: Decodable {
     /// Servidores Carraca en orden de preferencia.
     var servers: [String] {
         [baseURL, baseURL2].compactMap { $0 }.map(ServerURL.normalize).filter { !$0.isEmpty }
+    }
+}
+
+/// Servidores Carraca: no van escritos en la app (cambian si se migra el VPS). Se aprenden de
+/// config.json y se recuerdan todos los que se han visto, así una cuenta con la dirección vieja
+/// se reconoce y se actualiza sola a la nueva.
+enum CarracaServers {
+    private static let hostsKey = "carraca.known.hosts"
+    private static let baseKey = "carraca.known.base"
+
+    /// Hosts conocidos (el del panel siempre).
+    static var hosts: Set<String> {
+        var h = Set(UserDefaults.standard.stringArray(forKey: hostsKey) ?? [])
+        if let p = URL(string: AppConfig.panel)?.host?.lowercased() { h.insert(p) }
+        return h
+    }
+
+    /// Último servidor que dio config.json (respaldo si config.json no responde).
+    static var lastBase: String? { UserDefaults.standard.string(forKey: baseKey) }
+
+    static func remember(_ cfg: RemoteConfig) {
+        let servers = cfg.servers
+        guard let first = servers.first else { return }
+        var h = Set(UserDefaults.standard.stringArray(forKey: hostsKey) ?? [])
+        for s in servers { if let host = URL(string: s)?.host?.lowercased() { h.insert(host) } }
+        UserDefaults.standard.set(Array(h), forKey: hostsKey)
+        UserDefaults.standard.set(first, forKey: baseKey)
+    }
+
+    static func isCarraca(_ server: String) -> Bool {
+        guard let h = URL(string: server)?.host?.lowercased() else { return false }
+        return hosts.contains(h)
     }
 }
 
@@ -198,7 +229,7 @@ extension String {
     }
 }
 
-struct CategoryLabel {
+struct CategoryLabel: Hashable {
     let name: String
     let tag: String?
 }
@@ -218,10 +249,12 @@ private let superscriptLetters: [Character: Character] = [
 struct Category: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
+    /// Nombre limpio + etiqueta (RAW, 4K…), calculado una vez (no en cada repintado).
+    let label: CategoryLabel
 
     static let all = Category(id: "*", name: "Todos")
 
-    init(id: String, name: String) { self.id = id; self.name = name }
+    init(id: String, name: String) { self.id = id; self.name = name; label = name.categoryLabel }
 
     enum CodingKeys: String, CodingKey { case category_id, category_name }
 
@@ -229,6 +262,7 @@ struct Category: Decodable, Identifiable, Hashable {
         let c = try d.container(keyedBy: CodingKeys.self)
         id = c.flexString(.category_id) ?? ""
         name = c.flexString(.category_name) ?? "Sin nombre"
+        label = name.categoryLabel
     }
 }
 
@@ -237,6 +271,8 @@ struct LiveStream: Decodable, Identifiable, Hashable {
     let name: String
     let icon: String?
     let categoryId: String
+    /// Nombre limpio + etiqueta (calculado una vez).
+    let label: CategoryLabel
     /// Solo en listas M3U: URL directa del canal.
     var directURL: URL? = nil
     /// Id del canal en la guía XMLTV (para "ahora / después").
@@ -251,6 +287,7 @@ struct LiveStream: Decodable, Identifiable, Hashable {
         self.icon = icon
         self.categoryId = categoryId
         self.directURL = directURL
+        label = name.channelLabel
     }
 
     enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id, epg_channel_id }
@@ -265,12 +302,16 @@ struct LiveStream: Decodable, Identifiable, Hashable {
         icon = c.flexString(.stream_icon).flatMap { $0.isEmpty ? nil : $0 }
         categoryId = c.flexString(.category_id) ?? ""
         epgId = c.flexString(.epg_channel_id).flatMap { $0.isEmpty ? nil : $0 }
+        label = name.channelLabel
     }
 }
 
 struct VodStream: Decodable, Identifiable, Hashable {
     let id: Int
     let name: String
+    /// Título limpio ("ES - Ice Age 4" -> "Ice Age 4") y año, calculados una vez al leer la lista.
+    let title: String
+    let year: Int?
     let icon: String?
     let categoryId: String
     let ext: String
@@ -280,7 +321,6 @@ struct VodStream: Decodable, Identifiable, Hashable {
     let trailer: String?
 
     var score: Double { Double(rating ?? "") ?? 0 }
-    var year: Int? { name.yearGuess }
 
     enum CodingKeys: String, CodingKey { case stream_id, name, stream_icon, category_id, container_extension, rating, added, trailer }
 
@@ -291,6 +331,8 @@ struct VodStream: Decodable, Identifiable, Hashable {
         }
         self.id = id
         name = c.flexString(.name) ?? "Película \(id)"
+        title = name.cleanTitle
+        year = name.yearGuess
         icon = c.flexString(.stream_icon).flatMap { $0.isEmpty ? nil : $0 }
         categoryId = c.flexString(.category_id) ?? ""
         ext = c.flexString(.container_extension).flatMap { $0.isEmpty ? nil : $0 } ?? "mp4"
@@ -303,6 +345,10 @@ struct VodStream: Decodable, Identifiable, Hashable {
 struct SeriesItem: Decodable, Identifiable, Hashable {
     let id: Int
     let name: String
+    /// Título limpio, año y géneros, calculados una vez al leer la lista.
+    let title: String
+    let year: Int?
+    let genres: [String]
     let cover: String?
     let categoryId: String
     let plot: String?
@@ -315,12 +361,6 @@ struct SeriesItem: Decodable, Identifiable, Hashable {
     let rating: String?
 
     var score: Double { Double(rating ?? "") ?? 0 }
-    var year: Int? { (releaseDate ?? "").yearGuess ?? name.yearGuess }
-    /// Géneros sueltos ("Drama, Comedia" -> ["Drama", "Comedia"]).
-    var genres: [String] {
-        (genre ?? "").split(whereSeparator: { ",/".contains($0) })
-            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    }
 
     enum CodingKeys: String, CodingKey { case series_id, name, cover, category_id, plot, genre, releaseDate, backdrop_path, last_modified, youtube_trailer, rating }
 
@@ -342,6 +382,11 @@ struct SeriesItem: Decodable, Identifiable, Hashable {
         updated = c.flexInt(.last_modified) ?? 0
         trailer = c.flexString(.youtube_trailer).flatMap { $0.isEmpty ? nil : $0 }
         rating = c.flexString(.rating)
+        title = name.cleanTitle
+        year = (releaseDate ?? "").yearGuess ?? name.yearGuess
+        // géneros sueltos ("Drama, Comedia" -> ["Drama", "Comedia"])
+        genres = (genre ?? "").split(whereSeparator: { ",/".contains($0) })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 }
 
@@ -659,6 +704,8 @@ final class XtreamAPI: @unchecked Sendable {
         self.pass = pass
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 45
+        cfg.urlCache = nil
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.httpAdditionalHeaders = ["User-Agent": "CarracaiOS/\(AppConfig.version)"]
         session = URLSession(configuration: cfg)
     }

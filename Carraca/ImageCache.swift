@@ -6,11 +6,28 @@ import CryptoKit
 actor ImageLoader {
     static let shared = ImageLoader()
 
+    /// En memoria: limitado por bytes (un fondo de 1400 px pesa como 10 pósteres), ~1/8 de la RAM y 150 MB como mucho.
     nonisolated let memory: NSCache<NSString, UIImage> = {
         let c = NSCache<NSString, UIImage>()
-        c.countLimit = 600
+        c.countLimit = 400
+        c.totalCostLimit = Int(min(Double(ProcessInfo.processInfo.physicalMemory) / 8, 150 * 1_048_576))
         return c
     }()
+
+    /// Sin URLCache: las imágenes ya se guardan reducidas en disco (antes iban dos veces).
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.urlCache = nil
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.timeoutIntervalForRequest = 20
+        cfg.httpMaximumConnectionsPerHost = 6
+        return URLSession(configuration: cfg)
+    }()
+
+    private static func cost(_ img: UIImage) -> Int {
+        guard let cg = img.cgImage else { return Int(img.size.width * img.size.height * img.scale * img.scale * 4) }
+        return cg.bytesPerRow * cg.height
+    }
     private var tasks: [String: Task<UIImage?, Never>] = [:]
 
     static let dir: URL = {
@@ -37,7 +54,7 @@ actor ImageLoader {
         tasks[k] = t
         let img = await t.value
         tasks[k] = nil
-        if let img { memory.setObject(img, forKey: k as NSString) }
+        if let img { memory.setObject(img, forKey: k as NSString, cost: Self.cost(img)) }
         return img
     }
 
@@ -50,7 +67,7 @@ actor ImageLoader {
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
             return await img.byPreparingForDisplay() ?? img
         }
-        guard let res = try? await URLSession.shared.data(from: url),
+        guard let res = try? await session.data(from: url),
               (res.1 as? HTTPURLResponse)?.statusCode ?? 200 < 400,
               let img = UIImage(data: res.0) else { return nil }
         // reducir al tamaño en que se pinta (un póster no necesita 2000 px)

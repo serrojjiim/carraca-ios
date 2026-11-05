@@ -1,5 +1,4 @@
 import SwiftUI
-import WebKit
 
 // MARK: - Directo
 
@@ -97,7 +96,7 @@ struct LiveView: View {
             CategoryListRow(name: "Todos los canales", tag: nil, count: streams.count, logo: nil, symbol: "square.grid.2x2")
                 .tag(Category.all)
             ForEach(categories) { c in
-                let l = c.name.categoryLabel
+                let l = c.label
                 CategoryListRow(name: l.name, tag: l.tag, count: counts[c.id] ?? 0, logo: logos[c.id]?.first)
                     .tag(c)
             }
@@ -118,7 +117,7 @@ struct LiveView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Seguir viendo").font(.caption).foregroundStyle(.secondary)
-                        Text(ch.name.channelLabel.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        Text(ch.label.name).font(.subheadline.weight(.semibold)).lineLimit(1)
                     }
                     Spacer()
                     Image(systemName: "play.fill").foregroundStyle(Color.accentColor)
@@ -135,7 +134,7 @@ struct LiveView: View {
         switch cat.id {
         case Category.all.id: return "Todos los canales"
         case Category.favorites.id: return "Favoritos"
-        default: return cat.name.categoryLabel.name
+        default: return cat.label.name
         }
     }
 
@@ -192,7 +191,7 @@ struct LiveView: View {
                 }
                 .buttonStyle(.plain)
                 ForEach(categories) { c in
-                    let l = c.name.categoryLabel
+                    let l = c.label
                     NavigationLink(value: c) {
                         CategoryCard(name: l.name, tag: l.tag, count: counts[c.id] ?? 0, logos: logos[c.id] ?? [])
                     }
@@ -218,7 +217,7 @@ struct LiveView: View {
                 CategoryListRow(name: "Todos los canales", tag: nil, count: streams.count, logo: nil, symbol: "square.grid.2x2")
             }
             ForEach(categories) { c in
-                let l = c.name.categoryLabel
+                let l = c.label
                 NavigationLink(value: c) {
                     CategoryListRow(name: l.name, tag: l.tag, count: counts[c.id] ?? 0, logo: logos[c.id]?.first)
                 }
@@ -293,7 +292,7 @@ struct LiveView: View {
         let api = session.api
         let urlFor: (LiveStream) -> URL? = { c in c.directURL ?? api?.liveURL(c.id) }
         guard let url = urlFor(s) else { return nil }
-        var item = PlayItem(url: url, title: s.name.channelLabel.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
+        var item = PlayItem(url: url, title: s.label.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
         let playable = list.filter { urlFor($0) != nil }
         item.channels = playable
         item.channelIndex = playable.firstIndex(of: s) ?? 0
@@ -407,7 +406,7 @@ struct ChannelListView: View {
                 }
                 .frame(maxWidth: 560)
 
-                Text(s.name.channelLabel.name).font(.headline).lineLimit(1)
+                Text(s.label.name).font(.headline).lineLimit(1)
                 if let now = epg.first {
                     Text("Ahora: \(now.title)\(range(now))").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 }
@@ -459,7 +458,7 @@ struct ChannelListView: View {
             // con guía del panel no hace falta preguntar al proveedor (una petición menos por canal)
             if session.guideEnabled {
                 await session.refreshGuide()
-                let g = session.nowNext(s)
+                let g = GuideStore.shared.nowNext(s)
                 if !g.isEmpty {
                     if selected == s { epg = g.map { EPGEntry(title: $0.title, start: $0.start, end: $0.end) } }
                     return
@@ -519,9 +518,10 @@ extension View {
 struct ChannelTitle: View {
     let stream: LiveStream
     @EnvironmentObject private var session: Session
+    @ObservedObject private var guide = GuideStore.shared
 
     var body: some View {
-        let l = stream.name.channelLabel
+        let l = stream.label
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Text(l.name).lineLimit(1).foregroundStyle(.primary)
@@ -530,7 +530,7 @@ struct ChannelTitle: View {
                     Image(systemName: "star.fill").font(.caption).foregroundStyle(.yellow)
                 }
             }
-            if let now = session.nowNext(stream).first {
+            if let now = guide.nowNext(stream).first {
                 HStack(spacing: 8) {
                     Text("Ahora: \(now.title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     ProgramProgress(entry: now).frame(width: 46)
@@ -590,6 +590,8 @@ struct MoviesView: View {
     @State private var newestAll: [VodStream] = []
     @State private var catNames: [String: String] = [:]
     @State private var seasonal: [VodStream] = []
+    /// Portada destacada (carrusel): estrenos recientes con buena nota.
+    @State private var featured: [VodStream] = []
     @ObservedObject private var theme = ThemeStore.shared
     @State private var reloading = false
     @State private var loading = false
@@ -639,7 +641,7 @@ struct MoviesView: View {
                 .navigationTitle("Películas")
                 .searchable(text: $query, prompt: "Buscar película")
                 .navigationDestination(for: Category.self) { cat in
-                    VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                    VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                 }
                 .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
                 .withSettings()
@@ -657,13 +659,13 @@ struct MoviesView: View {
             NavigationStack {
                 Group {
                     if query.isEmpty, let cat = selected, cat != Category.home {
-                        VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                        VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                     } else {
                         main.navigationTitle(query.isEmpty ? "Inicio" : "Resultados")
                     }
                 }
                 .navigationDestination(for: Category.self) { cat in
-                    VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                    VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                 }
                 .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
             }
@@ -675,35 +677,42 @@ struct MoviesView: View {
     private var home: some View {
         let w: CGFloat = hsize == .regular ? 150 : 112
         let cont = continuing
+        let api = session.api
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
+                if !featured.isEmpty {
+                    FeaturedCarousel(items: featured, height: hsize == .regular ? 340 : 210, slide: { m in
+                        FeaturedSlide(id: "m\(m.id)", title: m.title, subtitle: featuredSubtitle(m),
+                                      backdrop: nil, poster: m.icon)
+                    }, backdrop: { m in (try? await api?.vodInfo(m.id))?.backdrop })
+                }
                 if !cont.isEmpty {
-                    PosterRail("Seguir viendo", items: cont, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                    PosterRail("Seguir viendo", items: cont, width: w, title: { $0.title }, image: { $0.icon },
                                progress: { m in session.resumeFor(movie: m.name).map { Double($0.pro) / 100 } })
                 }
                 let mine = session.watchlist.compactMap { k in k.hasPrefix("m") ? Int(k.dropFirst()).flatMap { byID[$0] } : nil }
                 if !mine.isEmpty {
-                    PosterRail("Mi lista", items: mine, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                    PosterRail("Mi lista", items: mine, width: w, title: { $0.title }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
                 }
                 if let t = theme.current, seasonal.count >= 3 {
                     PosterRail("\(t.emoji) \(t.railTitle)", seeAll: t.railCategory, count: seasonal.count,
-                               items: Array(seasonal.prefix(20)), width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                               items: Array(seasonal.prefix(20)), width: w, title: { $0.title }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
                 }
                 if !recent.isEmpty {
-                    PosterRail("Recién añadidas", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                    PosterRail("Recién añadidas", items: recent, width: w, title: { $0.title }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
                 }
                 if !top.isEmpty {
-                    PosterRail("Mejor valoradas", items: top, width: w, title: { $0.name.cleanTitle }, image: { $0.icon },
+                    PosterRail("Mejor valoradas", items: top, width: w, title: { $0.title }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
                 }
                 ForEach(categories) { c in
-                    let l = c.name.categoryLabel
+                    let l = c.label
                     PosterRail(l.name, tag: l.tag, seeAll: c, count: counts[c.id] ?? 0,
                                items: Array((byCategory[c.id] ?? []).prefix(20)), width: w,
-                               title: { $0.name.cleanTitle }, image: { $0.icon },
+                               title: { $0.title }, image: { $0.icon },
                                watched: { session.isWatched(movie: $0.name) })
                 }
             }
@@ -755,6 +764,8 @@ struct MoviesView: View {
             recent = Array(newest.prefix(20))
             // Mejor nota entre las ~600 más recientes (en el catálogo antiguo hay notas sin sentido).
             top = Array(newest.prefix(600).filter { $0.score >= 6.5 && $0.score < 10 }.sorted { $0.score > $1.score }.prefix(20))
+            let good = newest.prefix(120).filter { $0.icon != nil && $0.score >= 6 && $0.score < 10 }
+            featured = Array((good.count >= 3 ? Array(good) : newest.filter { $0.icon != nil }).prefix(6))
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             catNames = Dictionary(cats.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
             newestAll = newest
@@ -768,23 +779,43 @@ struct MoviesView: View {
     }
 }
 
+/// "2024 · ★ 7.1" bajo el título de la portada destacada.
+func featuredSubtitle(_ m: VodStream) -> String {
+    var parts: [String] = []
+    if let y = m.year { parts.append(String(y)) }
+    if m.score > 0 && m.score < 10 { parts.append(String(format: "★ %.1f", m.score)) }
+    return parts.joined(separator: " · ")
+}
+
 /// Orden de las cuadrículas de pelis y series.
 enum GridSort: String, CaseIterable {
     case recent = "Más recientes", az = "A–Z", rating = "Mejor nota", year = "Año"
+}
+
+/// Clave para recalcular el orden de una cuadrícula solo cuando cambia algo (no en cada repintado).
+func gridKey<T: Identifiable>(_ items: [T], _ parts: String...) -> String {
+    "\(items.count)|\(String(describing: items.first?.id))|\(String(describing: items.last?.id))|" + parts.joined(separator: "|")
+}
+
+func sortVod(_ items: [VodStream], _ sort: GridSort) -> [VodStream] {
+    switch sort {
+    case .recent: return items
+    case .az: return items.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    case .rating: return items.sorted { $0.score > $1.score }
+    case .year: return items.sorted { ($0.year ?? 0) > ($1.year ?? 0) }
+    }
 }
 
 struct VodGrid: View {
     let items: [VodStream]
     @EnvironmentObject private var session: Session
     @State private var sort = GridSort.recent
+    /// Ya ordenadas: el orden se calcula fuera del hilo principal y solo al cambiar.
+    @State private var sorted: [VodStream]
 
-    private var sorted: [VodStream] {
-        switch sort {
-        case .recent: return items
-        case .az: return items.sorted { $0.name.cleanTitle.localizedCaseInsensitiveCompare($1.name.cleanTitle) == .orderedAscending }
-        case .rating: return items.sorted { $0.score > $1.score }
-        case .year: return items.sorted { ($0.year ?? 0) > ($1.year ?? 0) }
-        }
+    init(items: [VodStream]) {
+        self.items = items
+        _sorted = State(initialValue: items)
     }
 
     var body: some View {
@@ -792,7 +823,7 @@ struct VodGrid: View {
             LazyVGrid(columns: posterColumns, spacing: 16) {
                 ForEach(sorted) { v in
                     NavigationLink(value: v) {
-                        PosterCell(title: v.name.cleanTitle, image: v.icon,
+                        PosterCell(title: v.title, image: v.icon,
                                    progress: session.resumeFor(movie: v.name).map { Double($0.pro) / 100 },
                                    watched: session.isWatched(movie: v.name))
                     }
@@ -810,6 +841,11 @@ struct VodGrid: View {
                 } label: { Image(systemName: "arrow.up.arrow.down") }
                 .accessibilityLabel("Ordenar")
             }
+        }
+        .task(id: gridKey(items, sort.rawValue)) {
+            let list = items, s = sort
+            if s == .recent { sorted = list; return }
+            sorted = await Task.detached(priority: .userInitiated) { sortVod(list, s) }.value
         }
     }
 }
@@ -848,7 +884,7 @@ struct MovieDetailView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(movie.name.cleanTitle).font(.title3.bold())
+                        Text(movie.title).font(.title3.bold())
                         if let g = info?.genre, !g.isEmpty { Text(g).font(.subheadline).foregroundStyle(.secondary) }
                         if let r = info?.release, !r.isEmpty { Text(r).font(.subheadline).foregroundStyle(.secondary) }
                         if let d = info?.duration, !d.isEmpty { Label(d, systemImage: "clock").font(.subheadline).foregroundStyle(.secondary) }
@@ -898,7 +934,7 @@ struct MovieDetailView: View {
 
                 downloadButton
 
-                if let p = info?.plot, !p.isEmpty { Text(p).foregroundStyle(.secondary) }
+                if let p = info?.plot, !p.isEmpty { ExpandableText(text: p, lineLimit: 5).foregroundStyle(.secondary) }
                 if let d = info?.director, !d.isEmpty { Text("Dirección: \(d)").font(.footnote).foregroundStyle(.secondary) }
                 if let cast = info?.castList, !cast.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
@@ -959,11 +995,11 @@ struct MovieDetailView: View {
         guard let api = session.api else { return }
         // si está descargada, se ve desde el iPhone (sin gastar datos ni la conexión de la cuenta)
         if let d = downloads.item("m\(movie.id)"), d.state == .done {
-            playing = PlayItem(url: downloads.fileURL(d), title: movie.name.cleanTitle, startMs: ms,
+            playing = PlayItem(url: downloads.fileURL(d), title: movie.title, startMs: ms,
                                resume: ResumeTarget(type: "movie", name: movie.name, itemId: String(movie.id)))
             return
         }
-        playing = PlayItem(url: api.movieURL(movie), title: movie.name.cleanTitle, startMs: ms,
+        playing = PlayItem(url: api.movieURL(movie), title: movie.title, startMs: ms,
                            resume: ResumeTarget(type: "movie", name: movie.name, itemId: String(movie.id)))
     }
 }
@@ -1039,7 +1075,7 @@ struct SeriesView: View {
                 .navigationTitle("Series")
                 .searchable(text: $query, prompt: "Buscar serie")
                 .navigationDestination(for: Category.self) { cat in
-                    SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                    SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                 }
                 .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
                 .withSettings()
@@ -1057,13 +1093,13 @@ struct SeriesView: View {
             NavigationStack {
                 Group {
                     if query.isEmpty, let cat = selected, cat != Category.home {
-                        SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                        SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                     } else {
                         main.navigationTitle(query.isEmpty ? "Inicio" : "Resultados")
                     }
                 }
                 .navigationDestination(for: Category.self) { cat in
-                    SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.name.categoryLabel.name)
+                    SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                 }
                 .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
             }
@@ -1077,31 +1113,32 @@ struct SeriesView: View {
         let cont = continuing
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
-                if let hero = recent.first(where: { $0.backdrop != nil }) {
-                    NavigationLink(value: hero) { HeroBanner(series: hero, height: hsize == .regular ? 320 : 200) }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal)
+                let heroes = Array(recent.lazy.filter { $0.backdrop != nil }.prefix(6))
+                if !heroes.isEmpty {
+                    FeaturedCarousel(items: heroes, height: hsize == .regular ? 340 : 210, slide: { s in
+                        FeaturedSlide(id: "s\(s.id)", title: s.title, subtitle: s.genre ?? "", backdrop: s.backdrop, poster: s.cover)
+                    })
                 }
                 if !cont.isEmpty {
-                    PosterRail("Seguir viendo", items: cont, width: w, title: { $0.name.cleanTitle }, image: { $0.cover },
+                    PosterRail("Seguir viendo", items: cont, width: w, title: { $0.title }, image: { $0.cover },
                                progress: { s in session.resumeFor(series: s.name).map { Double($0.pro) / 100 } })
                 }
                 let mine = session.watchlist.compactMap { k in k.hasPrefix("s") ? Int(k.dropFirst()).flatMap { byID[$0] } : nil }
                 if !mine.isEmpty {
-                    PosterRail("Mi lista", items: mine, width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
+                    PosterRail("Mi lista", items: mine, width: w, title: { $0.title }, image: { $0.cover })
                 }
                 if let t = theme.current, seasonal.count >= 3 {
                     PosterRail("\(t.emoji) \(t.railTitle)", seeAll: t.railCategory, count: seasonal.count,
-                               items: Array(seasonal.prefix(20)), width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
+                               items: Array(seasonal.prefix(20)), width: w, title: { $0.title }, image: { $0.cover })
                 }
                 if !recent.isEmpty {
-                    PosterRail("Con capítulos nuevos", items: recent, width: w, title: { $0.name.cleanTitle }, image: { $0.cover })
+                    PosterRail("Con capítulos nuevos", items: recent, width: w, title: { $0.title }, image: { $0.cover })
                 }
                 ForEach(categories) { c in
-                    let l = c.name.categoryLabel
+                    let l = c.label
                     PosterRail(l.name, tag: l.tag, seeAll: c, count: counts[c.id] ?? 0,
                                items: Array((byCategory[c.id] ?? []).prefix(20)), width: w,
-                               title: { $0.name.cleanTitle }, image: { $0.cover })
+                               title: { $0.title }, image: { $0.cover })
                 }
             }
             .padding(.vertical)
@@ -1165,30 +1202,153 @@ struct SeriesView: View {
     }
 }
 
-/// Portada grande de una serie (imagen horizontal + título).
-struct HeroBanner: View {
-    let series: SeriesItem
+/// Una diapositiva de la portada destacada.
+struct FeaturedSlide {
+    let id: String
+    let title: String
+    let subtitle: String
+    let backdrop: String?
+    let poster: String?
+}
+
+/// Portada destacada en carrusel (pasa sola cada 7 s; al deslizar a mano se reinicia la cuenta).
+/// Si la diapositiva no trae imagen horizontal se pide al tocarle el turno (`backdrop`) y,
+/// mientras, se ve la carátula desenfocada de fondo con la carátula al lado.
+struct FeaturedCarousel<Item: Hashable>: View {
+    let items: [Item]
+    let height: CGFloat
+    let slide: (Item) -> FeaturedSlide
+    var backdrop: ((Item) async -> String?)? = nil
+
+    @State private var page = 0
+    @State private var loaded: [String: String] = [:]
+    @State private var asked: Set<String> = []
+
+    var body: some View {
+        TabView(selection: $page) {
+            ForEach(Array(items.enumerated()), id: \.offset) { i, item in
+                let s = slide(item)
+                NavigationLink(value: item) { FeaturedCard(slide: s, backdrop: s.backdrop ?? loaded[s.id], height: height) }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal)
+                    .tag(i)
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: items.count > 1 ? .always : .never))
+        .frame(height: height)
+        .task(id: page) {
+            await fetchBackdrop(page)
+            guard items.count > 1 else { return }
+            try? await Task.sleep(nanoseconds: 7_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.5)) { page = (page + 1) % items.count }
+        }
+    }
+
+    @MainActor
+    private func fetchBackdrop(_ i: Int) async {
+        guard let backdrop, items.indices.contains(i) else { return }
+        let s = slide(items[i])
+        guard s.backdrop == nil, asked.insert(s.id).inserted else { return }
+        if let b = await backdrop(items[i]) { loaded[s.id] = b }
+    }
+}
+
+private struct FeaturedCard: View {
+    let slide: FeaturedSlide
+    let backdrop: String?
     let height: CGFloat
 
     var body: some View {
         Color.clear
             .frame(maxWidth: .infinity)
             .frame(height: height)
-            .overlay { RemoteImage(url: series.backdrop, maxPixel: 1400) }
             .overlay {
-                LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .center, endPoint: .bottom)
+                if let b = backdrop {
+                    RemoteImage(url: b, maxPixel: 1400).transition(.opacity)
+                } else {
+                    RemoteImage(url: slide.poster).blur(radius: 26).opacity(0.75)
+                }
+            }
+            .overlay {
+                LinearGradient(colors: [.clear, .black.opacity(0.88)], startPoint: .center, endPoint: .bottom)
             }
             .overlay(alignment: .bottomLeading) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(series.name.cleanTitle).font(.title2.bold()).lineLimit(2)
-                    if let g = series.genre, !g.isEmpty {
-                        Text(g).font(.subheadline).opacity(0.85).lineLimit(1)
+                HStack(alignment: .bottom, spacing: 14) {
+                    if backdrop == nil, slide.poster != nil {
+                        Color.clear
+                            .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                            .frame(height: height * 0.6)
+                            .overlay { RemoteImage(url: slide.poster) }
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .shadow(color: .black.opacity(0.5), radius: 10, y: 4)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(slide.title).font(.title2.bold()).lineLimit(2)
+                        if !slide.subtitle.isEmpty {
+                            Text(slide.subtitle).font(.subheadline).opacity(0.85).lineLimit(1)
+                        }
                     }
                 }
                 .foregroundStyle(.white)
                 .padding()
+                .padding(.bottom, 12)
             }
             .clipShape(RoundedRectangle(cornerRadius: 14))
+            .animation(.easeInOut(duration: 0.4), value: backdrop)
+            .contentShape(Rectangle())
+    }
+}
+
+/// Texto largo (sinopsis) recortado a unas líneas con "Leer más" si no cabe.
+struct ExpandableText: View {
+    let text: String
+    var lineLimit = 4
+    @State private var expanded = false
+    @State private var truncated = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(text)
+                .lineLimit(expanded ? nil : lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+                .background {
+                    // mide el texto entero (oculto) para saber si hace falta el botón
+                    GeometryReader { limited in
+                        Text(text)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(width: limited.size.width, alignment: .leading)
+                            .background {
+                                GeometryReader { full in
+                                    Color.clear
+                                        .onAppear { if !expanded { truncated = full.size.height > limited.size.height + 2 } }
+                                        .onChange(of: limited.size.width) { _ in
+                                            if !expanded { truncated = full.size.height > limited.size.height + 2 }
+                                        }
+                                }
+                            }
+                            .hidden()
+                    }
+                }
+            if truncated || expanded {
+                Button(expanded ? "Leer menos" : "Leer más") {
+                    withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.accentColor)
+                .buttonStyle(.borderless)
+            }
+        }
+    }
+}
+
+func filterSortSeries(_ items: [SeriesItem], _ sort: GridSort, _ genre: String) -> [SeriesItem] {
+    let list = genre.isEmpty ? items : items.filter { $0.genres.contains(genre) }
+    switch sort {
+    case .recent: return list
+    case .az: return list.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    case .rating: return list.sorted { $0.score > $1.score }
+    case .year: return list.sorted { ($0.year ?? 0) > ($1.year ?? 0) }
     }
 }
 
@@ -1196,28 +1356,20 @@ struct SeriesGrid: View {
     let items: [SeriesItem]
     @State private var sort = GridSort.recent
     @State private var genre = ""
+    /// Ya filtradas y ordenadas (se recalculan solo al cambiar lista, orden o género).
+    @State private var shown: [SeriesItem]
+    @State private var genres: [String] = []
 
-    private var genres: [String] {
-        var count: [String: Int] = [:]
-        for s in items { for g in s.genres { count[g, default: 0] += 1 } }
-        return count.filter { $0.value >= 2 }.keys.sorted()
-    }
-
-    private var shown: [SeriesItem] {
-        let list = genre.isEmpty ? items : items.filter { $0.genres.contains(genre) }
-        switch sort {
-        case .recent: return list
-        case .az: return list.sorted { $0.name.cleanTitle.localizedCaseInsensitiveCompare($1.name.cleanTitle) == .orderedAscending }
-        case .rating: return list.sorted { $0.score > $1.score }
-        case .year: return list.sorted { ($0.year ?? 0) > ($1.year ?? 0) }
-        }
+    init(items: [SeriesItem]) {
+        self.items = items
+        _shown = State(initialValue: items)
     }
 
     var body: some View {
         ScrollView {
             LazyVGrid(columns: posterColumns, spacing: 16) {
                 ForEach(shown) { s in
-                    NavigationLink(value: s) { PosterCell(title: s.name.cleanTitle, image: s.cover) }
+                    NavigationLink(value: s) { PosterCell(title: s.title, image: s.cover) }
                         .buttonStyle(.plain)
                 }
             }
@@ -1240,6 +1392,19 @@ struct SeriesGrid: View {
                 }
                 .accessibilityLabel("Ordenar y filtrar")
             }
+        }
+        .task(id: gridKey(items)) {
+            let list = items
+            genres = await Task.detached(priority: .utility) { () -> [String] in
+                var count: [String: Int] = [:]
+                for s in list { for g in s.genres { count[g, default: 0] += 1 } }
+                return count.filter { $0.value >= 2 }.keys.sorted()
+            }.value
+        }
+        .task(id: gridKey(items, sort.rawValue, genre)) {
+            let list = items, s = sort, g = genre
+            if s == .recent && g.isEmpty { shown = list; return }
+            shown = await Task.detached(priority: .userInitiated) { filterSortSeries(list, s, g) }.value
         }
     }
 }
@@ -1362,7 +1527,7 @@ struct SeriesDetailView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(series.name.cleanTitle).font(.title3.bold())
+                    Text(series.title).font(.title3.bold())
                     if let g = series.genre, !g.isEmpty { Text(g).font(.subheadline).foregroundStyle(.secondary) }
                     if let n = info?.seasons.count, n > 0 {
                         Text(n == 1 ? "1 temporada" : "\(n) temporadas").font(.subheadline).foregroundStyle(.secondary)
@@ -1388,7 +1553,7 @@ struct SeriesDetailView: View {
             .padding(.horizontal, 4)
             .padding(.top, -90)
             if let p = info?.plot ?? series.plot, !p.isEmpty {
-                Text(p).font(.footnote).foregroundStyle(.secondary).lineLimit(8)
+                ExpandableText(text: p, lineLimit: 4).font(.footnote).foregroundStyle(.secondary)
                     .padding(.horizontal, 4)
                     .padding(.top, 14)
             }
@@ -1470,7 +1635,7 @@ struct SeriesDetailView: View {
     private func download(_ ep: Episode) {
         guard let api = session.api else { return }
         let s = seasonOf(ep)
-        Downloads.shared.enqueue(DownloadItem(id: "e\(ep.id)", kind: "series", title: series.name.cleanTitle,
+        Downloads.shared.enqueue(DownloadItem(id: "e\(ep.id)", kind: "series", title: series.title,
                                               subtitle: "T\(s) · E\(ep.number) · \(ep.title.cleanTitle)",
                                               image: ep.image ?? series.cover, remote: api.episodeURL(ep).absoluteString,
                                               ext: ep.ext, resumeName: series.name, itemId: ep.id,
@@ -1487,7 +1652,7 @@ struct SeriesDetailView: View {
     /// Lo que se reproduce para un capítulo, con el siguiente ya preparado (siguiente capítulo automático).
     static func episodeItem(series: SeriesItem, ep: Episode, season s: Int, from ms: Int,
                             api: XtreamAPI, info: SeriesInfo?) -> PlayItem {
-        var item = PlayItem(url: api.episodeURL(ep), title: series.name.cleanTitle,
+        var item = PlayItem(url: api.episodeURL(ep), title: series.title,
                             subtitle: "T\(s) · E\(ep.number) · \(ep.title.cleanTitle)", startMs: ms,
                             resume: ResumeTarget(type: "series", name: series.name, itemId: ep.id, season: s, episode: ep.number))
         if let info, let n = episodeAfter(ep, season: s, in: info) {
@@ -1675,51 +1840,6 @@ struct ResumeRow: View {
     }
 }
 
-// MARK: - Deportes de hoy (misma página del panel que usa Android)
-
-struct SportsView: View {
-    @State private var reload = 0
-
-    var body: some View {
-        NavigationStack {
-            WebView(url: AppConfig.sportsURL, reloadToken: reload)
-                .background(Color("LaunchBg"))
-                .navigationTitle("Deportes de hoy")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button { reload += 1 } label: { Image(systemName: "arrow.clockwise") }
-                    }
-                }
-        }
-    }
-}
-
-struct WebView: UIViewRepresentable {
-    let url: URL
-    let reloadToken: Int
-
-    final class Coordinator { var token = 0 }
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let w = WKWebView()
-        w.isOpaque = false
-        w.backgroundColor = .clear
-        w.scrollView.backgroundColor = .clear
-        w.load(URLRequest(url: url))
-        context.coordinator.token = reloadToken
-        return w
-    }
-
-    func updateUIView(_ w: WKWebView, context: Context) {
-        if context.coordinator.token != reloadToken {
-            context.coordinator.token = reloadToken
-            w.reload()
-        }
-    }
-}
-
 // MARK: - Buscador global (canales, películas y series a la vez)
 
 struct GlobalSearchView: View {
@@ -1755,14 +1875,14 @@ struct GlobalSearchView: View {
                     if !mv.isEmpty {
                         Section("Películas") {
                             ForEach(mv) { m in
-                                NavigationLink(value: m) { searchRow(m.name.cleanTitle, m.icon, m.year) }
+                                NavigationLink(value: m) { searchRow(m.title, m.icon, m.year) }
                             }
                         }
                     }
                     if !sr.isEmpty {
                         Section("Series") {
                             ForEach(sr) { s in
-                                NavigationLink(value: s) { searchRow(s.name.cleanTitle, s.cover, s.year) }
+                                NavigationLink(value: s) { searchRow(s.title, s.cover, s.year) }
                             }
                         }
                     }
@@ -1833,7 +1953,7 @@ struct GlobalSearchView: View {
         let api = session.api
         let urlFor: (LiveStream) -> URL? = { c in c.directURL ?? api?.liveURL(c.id) }
         guard let url = urlFor(s) else { return }
-        var item = PlayItem(url: url, title: s.name.channelLabel.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
+        var item = PlayItem(url: url, title: s.label.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
         let playable = list.filter { urlFor($0) != nil }
         item.channels = playable
         item.channelIndex = playable.firstIndex(of: s) ?? 0

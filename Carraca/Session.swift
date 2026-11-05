@@ -103,9 +103,6 @@ final class Session: ObservableObject {
     var isLoggedIn: Bool { creds != nil }
     var isM3U: Bool { creds?.m3u != nil }
 
-    /// Servidores Carraca conocidos (proxy IPTV + dominio del panel).
-    static let carracaHosts: Set<String> = ["82.165.142.230", "carracaservice.duckdns.org"]
-
     /// Pestaña "Eventos" (agenda pública de deportes del día): visible para todos los usuarios,
     /// sin depender de qué servidor usen (nada oculto para la revisión de Apple).
     var showsEvents: Bool { true }
@@ -114,8 +111,7 @@ final class Session: ObservableObject {
     var isCarracaServer: Bool {
         guard let c = creds, c.m3u == nil else { return false }
         if c.usesDefaultServer { return true }
-        guard let h = URL(string: c.server)?.host?.lowercased() else { return false }
-        return Session.carracaHosts.contains(h)
+        return CarracaServers.isCarraca(c.server)
     }
 
     /// Seguir viendo: con cuentas del servidor Carraca lo guarda el panel (resume.php), así lo
@@ -129,7 +125,7 @@ final class Session: ObservableObject {
     init() {
         if let c = Keychain.load() { apply(c) }
         Task {
-            if Flavor.isPrivate { await refreshRemote() }
+            await refreshRemote()
             await refreshResume()
             if let api { account = try? await api.authenticate() }
         }
@@ -140,41 +136,17 @@ final class Session: ObservableObject {
         api = c.m3u == nil ? XtreamAPI(base: c.server, user: c.user, pass: c.pass) : nil
         favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
         watchlist = UserDefaults.standard.stringArray(forKey: watchlistKey) ?? []
-        guide = [:]
-        guideLoaded = .distantPast
+        GuideStore.shared.reset()
     }
 
     // MARK: Guía "ahora / después" (solo cuentas del servidor Carraca: la genera su panel)
 
-    @Published private(set) var guide: [String: [GuideEntry]] = [:]
-    private var guideLoaded = Date.distantPast
-
     var guideEnabled: Bool { isCarracaServer }
 
-    /// Una petición para todos los canales; como mucho cada 10 minutos.
+    /// La guía vive aparte (GuideStore): cuando se actualiza solo se repintan los canales,
+    /// no las pestañas de pelis y series.
     func refreshGuide(force: Bool = false) async {
-        guard guideEnabled, force || Date().timeIntervalSince(guideLoaded) > 600 else { return }
-        guideLoaded = Date()
-        guard let url = URL(string: AppConfig.panel + "/epg_now.php"),
-              let res = try? await URLSession.shared.data(from: url),
-              let obj = try? JSONSerialization.jsonObject(with: res.0) as? [String: Any],
-              let chans = obj["c"] as? [String: [[Any]]] else { return }
-        var g: [String: [GuideEntry]] = [:]
-        for (id, list) in chans {
-            g[id] = list.compactMap { p in
-                guard p.count >= 3, let a = (p[0] as? NSNumber)?.doubleValue, let b = (p[1] as? NSNumber)?.doubleValue,
-                      let t = p[2] as? String else { return nil }
-                return GuideEntry(start: Date(timeIntervalSince1970: a), end: Date(timeIntervalSince1970: b), title: t)
-            }
-        }
-        guide = g
-    }
-
-    /// Lo que echan ahora (y después) en un canal.
-    func nowNext(_ s: LiveStream) -> [GuideEntry] {
-        guard let id = s.epgId, let list = guide[id] else { return [] }
-        let now = Date()
-        return Array(list.filter { $0.end > now }.prefix(2))
+        await GuideStore.shared.refresh(enabled: guideEnabled, force: force)
     }
 
     // MARK: Último canal visto
@@ -183,6 +155,12 @@ final class Session: ObservableObject {
     var lastChannelID: Int? {
         get { UserDefaults.standard.object(forKey: lastChannelKey) as? Int }
         set { UserDefaults.standard.set(newValue, forKey: lastChannelKey); objectWillChange.send() }
+    }
+
+    /// Mientras se ve la tele se guarda sin avisar a las pantallas (nada se repinta detrás del
+    /// reproductor en cada cambio de canal); al cerrar el reproductor se avisa una sola vez.
+    func storeLastChannel(_ id: Int) {
+        UserDefaults.standard.set(id, forKey: lastChannelKey)
     }
 
     // MARK: Mi lista (pelis y series para ver luego, en el dispositivo)
@@ -296,18 +274,22 @@ final class Session: ObservableObject {
         prefill = LoginPrefill(server: v("s"), user: v("u"), pass: v("p"), m3u: v("m3u"))
     }
 
-    // MARK: config.json (solo versión privada)
+    // MARK: config.json
 
+    /// Servidores Carraca (en las dos versiones: así se reconoce una cuenta de Carraca aunque la
+    /// dirección se haya escrito a mano) y, solo en la privada, aviso de versión nueva.
     func refreshRemote() async {
-        guard Flavor.isPrivate,
-              let res = try? await URLSession.shared.data(from: AppConfig.configURL),
+        guard let res = try? await URLSession.shared.data(from: AppConfig.configURL),
               let cfg = try? JSONDecoder().decode(RemoteConfig.self, from: res.0) else { return }
+        // ¿Era una cuenta de Carraca con los servidores de antes? (p. ej. la IP vieja tras migrar)
+        let wasCarraca = creds.map { $0.m3u == nil && ($0.usesDefaultServer || CarracaServers.isCarraca($0.server)) } ?? false
+        CarracaServers.remember(cfg)
         remote = cfg
-        if let v = cfg.iosVersionCode, v > AppConfig.build, cfg.iosInstallURL != nil {
+        if Flavor.isPrivate, let v = cfg.iosVersionCode, v > AppConfig.build, cfg.iosInstallURL != nil {
             update = cfg
         }
-        // Cuenta en el servidor Carraca: si cambia (migración de VPS) se actualiza sola.
-        if var c = creds, c.usesDefaultServer, let s = cfg.servers.first, s != c.server {
+        // Cuenta del servidor Carraca: si el servidor cambia (migración de VPS) se actualiza sola.
+        if var c = creds, wasCarraca, let s = cfg.servers.first, s != c.server {
             c.server = s
             Keychain.save(c)
             apply(c)
@@ -326,7 +308,8 @@ final class Session: ObservableObject {
         if custom.isEmpty {
             if remote == nil { await refreshRemote() }
             candidates = remote?.servers ?? []
-            if candidates.isEmpty { candidates = [AppConfig.fallbackServer] }
+            // config.json no responde: el último servidor que dio
+            if candidates.isEmpty, let last = CarracaServers.lastBase { candidates = [last] }
         } else {
             candidates = [custom]
         }
@@ -394,7 +377,7 @@ final class Session: ObservableObject {
         resume = []
         watched = []
         watchlist = []
-        guide = [:]
+        GuideStore.shared.reset()
     }
 
     // MARK: Seguir viendo
@@ -453,6 +436,8 @@ final class Session: ObservableObject {
     }
 
     /// Guarda el progreso (panel en la privada, dispositivo en la genérica).
+    /// No toca `resume`: eso repintaría todas las pestañas detrás del reproductor cada 30 s.
+    /// La lista se vuelve a leer al cerrar el reproductor.
     func report(_ item: PlayItem, timeMs: Int, lengthMs: Int) {
         guard resumeEnabled, let r = item.resume, let user = creds?.user,
               lengthMs > 60_000, timeMs > 10_000 else { return }
@@ -470,7 +455,6 @@ final class Session: ObservableObject {
             LocalResume.upsert(ResumeItem(type: r.type, name: r.name, itemId: r.itemId, url: item.url.absoluteString,
                                           season: r.season, episode: r.episode, position: timeMs,
                                           duration: lengthMs, pro: pro, ts: Int(Date().timeIntervalSince1970)))
-            resume = LocalResume.load()
             return
         }
 
@@ -484,5 +468,57 @@ final class Session: ObservableObject {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         URLSession.shared.dataTask(with: req).resume()
+    }
+}
+
+// MARK: - Guía "ahora / después"
+
+/// Guía de todos los canales (epg_now.php del panel). Va aparte de Session para que su
+/// actualización (cada 10 min) solo repinte las filas de canales; se descarga y se procesa
+/// fuera del hilo principal (son ~400 KB).
+@MainActor
+final class GuideStore: ObservableObject {
+    static let shared = GuideStore()
+
+    @Published private(set) var guide: [String: [GuideEntry]] = [:]
+    private var loaded = Date.distantPast
+
+    func reset() {
+        guide = [:]
+        loaded = .distantPast
+    }
+
+    /// Una petición para todos los canales; como mucho cada 10 minutos.
+    func refresh(enabled: Bool, force: Bool = false) async {
+        guard enabled, force || Date().timeIntervalSince(loaded) > 600 else { return }
+        loaded = Date()
+        guard let url = URL(string: AppConfig.panel + "/epg_now.php") else { return }
+        let parsed: [String: [GuideEntry]]? = await Task.detached(priority: .utility) {
+            guard let res = try? await URLSession.shared.data(from: url) else { return nil }
+            return GuideStore.parse(res.0)
+        }.value
+        if let parsed { guide = parsed }
+    }
+
+    nonisolated static func parse(_ data: Data) -> [String: [GuideEntry]]? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let chans = obj["c"] as? [String: [[Any]]] else { return nil }
+        var g: [String: [GuideEntry]] = [:]
+        g.reserveCapacity(chans.count)
+        for (id, list) in chans {
+            g[id] = list.compactMap { p in
+                guard p.count >= 3, let a = (p[0] as? NSNumber)?.doubleValue, let b = (p[1] as? NSNumber)?.doubleValue,
+                      let t = p[2] as? String else { return nil }
+                return GuideEntry(start: Date(timeIntervalSince1970: a), end: Date(timeIntervalSince1970: b), title: t)
+            }
+        }
+        return g
+    }
+
+    /// Lo que echan ahora (y después) en un canal.
+    func nowNext(_ s: LiveStream) -> [GuideEntry] {
+        guard let id = s.epgId, let list = guide[id] else { return [] }
+        let now = Date()
+        return Array(list.lazy.filter { $0.end > now }.prefix(2))
     }
 }

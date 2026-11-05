@@ -7,14 +7,28 @@ struct Track: Identifiable, Hashable {
     let name: String
 }
 
+/// Tiempo y duración del vídeo, aparte del controlador: cambian varias veces por segundo y así
+/// solo se repinta la barra de progreso, no todo el reproductor.
+final class PlaybackClock: ObservableObject {
+    @Published var timeMs = 0
+    @Published var lengthMs = 0
+}
+
 /// Envoltorio del motor VLC (reproduce TS, MKV, AVI…).
 final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let player = VLCMediaPlayer()
+    let clock = PlaybackClock()
 
     @Published var playing = false
     @Published var buffering = true
-    @Published var timeMs = 0
-    @Published var lengthMs = 0
+    var timeMs: Int {
+        get { clock.timeMs }
+        set { if clock.timeMs != newValue { clock.timeMs = newValue } }
+    }
+    var lengthMs: Int {
+        get { clock.lengthMs }
+        set { if clock.lengthMs != newValue { clock.lengthMs = newValue } }
+    }
     @Published var failed = false
     @Published var ended = false
     /// Por qué no se ha podido reproducir (se pregunta una vez al servidor, al rendirse).
@@ -237,7 +251,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 if abs(t - target) > 15_000 && Date().timeIntervalSince(self.seekStarted) < 20 { return }
                 self.seekTarget = nil
             }
-            self.timeMs = t
+            // VLC avisa ~4 veces por segundo; la barra no necesita tanto
+            if abs(t - self.timeMs) >= 450 || t < self.timeMs { self.timeMs = t }
             if let len = self.player.media?.length.intValue, len > 0 { self.lengthMs = Int(len) }
             if self.buffering { self.buffering = false }
             if !self.playing && self.player.isPlaying { self.playing = true }
@@ -322,8 +337,9 @@ struct PlayerView: View {
     @StateObject private var vlc = VLCController()
     @State private var showControls = true
     @State private var hideWork: DispatchWorkItem?
-    @State private var scrub: Double?
     @State private var epg: [EPGEntry] = []
+    /// Directo: panel con la lista de canales (botón o deslizar desde el borde derecho).
+    @State private var showChannels = false
     /// Directo: posición del canal actual dentro de item.channels (para anterior/siguiente).
     @State private var channelIndex: Int?
     @State private var zapWork: DispatchWorkItem?
@@ -347,9 +363,8 @@ struct PlayerView: View {
         guard let i = channelIndex, item.channels.indices.contains(i) else { return nil }
         return item.channels[i]
     }
-    private var title: String { currentChannel?.name.channelLabel.name ?? item.title }
+    private var title: String { currentChannel?.label.name ?? item.title }
     private var canZap: Bool { item.isLive && item.channels.count > 1 && item.channelURL != nil }
-    private var remainingMs: Int { max(0, vlc.lengthMs - vlc.timeMs) }
 
     var body: some View {
         ZStack {
@@ -367,10 +382,16 @@ struct PlayerView: View {
                         withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
                         if showControls { scheduleHide() }
                     }
-                    // Directo: deslizar a izquierda/derecha cambia de canal.
+                    // Directo: deslizar a izquierda/derecha cambia de canal;
+                    // desde el borde derecho hacia dentro, abre la lista de canales.
                     .gesture(DragGesture(minimumDistance: 40).onEnded { v in
                         let dx = v.translation.width, dy = v.translation.height
-                        guard canZap, abs(dx) > 80, abs(dx) > abs(dy) * 1.5 else { return }
+                        guard canZap, abs(dx) > abs(dy) * 1.5 else { return }
+                        if v.startLocation.x > geo.size.width - 70, dx < -50 {
+                            openChannels()
+                            return
+                        }
+                        guard abs(dx) > 80 else { return }
                         zap(dx < 0 ? 1 : -1)
                     })
             }
@@ -383,8 +404,18 @@ struct PlayerView: View {
                 upNextCard(next)
             } else if vlc.failed {
                 failure
-            } else if showControls {
+            } else if showControls && !showChannels {
                 controls.transition(.opacity)
+            }
+            if showChannels {
+                ChannelPanel(channels: item.channels, current: channelIndex,
+                             onPick: { i in
+                                 withAnimation(.easeInOut(duration: 0.25)) { showChannels = false }
+                                 if i != channelIndex { zapTo(i, delay: 0.25) }
+                             },
+                             onClose: { withAnimation(.easeInOut(duration: 0.25)) { showChannels = false } })
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .zIndex(2)
             }
         }
         .background(keyboardShortcuts)
@@ -405,6 +436,8 @@ struct PlayerView: View {
         }
         .onDisappear {
             report()
+            // el último canal se guardó sin avisar; ahora sí, para "Seguir viendo · canal"
+            if item.isLive { session.objectWillChange.send() }
             // Ajustes > Descargas > Borrar lo ya visto
             Downloads.shared.removeWatched(session.isWatched(download:))
             vlc.stop()
@@ -469,6 +502,16 @@ struct PlayerView: View {
                         }
                     }
                     Spacer()
+                    if canZap {
+                        Button { openChannels() } label: {
+                            Image(systemName: "list.bullet")
+                                .font(.title3)
+                                .frame(width: 22, height: 22)
+                                .padding(12)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .accessibilityLabel("Lista de canales")
+                    }
                     optionsMenu
                     if !vlc.audioTracks.isEmpty || !vlc.subtitleTracks.isEmpty { tracksMenu }
                 }
@@ -508,48 +551,25 @@ struct PlayerView: View {
                         Spacer()
                     }
                     .padding()
-                } else if vlc.lengthMs > 0 {
-                    VStack(alignment: .trailing, spacing: 8) {
-                        // En los créditos: pasar ya al siguiente capítulo.
-                        if item.next != nil, remainingMs < 90_000, remainingMs > 0 {
-                            Button { playNextNow() } label: {
-                                Label("Siguiente capítulo", systemImage: "forward.end.fill")
-                                    .font(.subheadline.bold())
-                                    .padding(.horizontal, 14).padding(.vertical, 8)
-                                    .background(.ultraThinMaterial, in: Capsule())
-                            }
-                        }
-                        seekBar
-                    }
-                    .padding(.horizontal).padding(.bottom, 14)
+                } else {
+                    SeekArea(clock: vlc.clock, hasNext: item.next != nil,
+                             onSeek: { f in vlc.seek(toFraction: f) },
+                             onNext: { playNextNow() },
+                             onEditing: { hideWork?.cancel() },
+                             onDone: { scheduleHide() })
                 }
             }
             .foregroundStyle(.white)
         }
     }
 
-    private var seekBar: some View {
-        VStack(spacing: 4) {
-            Slider(value: Binding(get: { scrub ?? fraction }, set: { scrub = $0 }), in: 0...1, onEditingChanged: { editing in
-                hideWork?.cancel()
-                if !editing, let f = scrub {
-                    vlc.seek(toFraction: f)
-                    scrub = nil
-                    scheduleHide()
-                }
-            })
-            .accessibilityLabel("Posición")
-            HStack {
-                Text(timeText(scrub.map { Int($0 * Double(vlc.lengthMs)) } ?? vlc.timeMs))
-                Spacer()
-                Text(timeText(vlc.lengthMs))
-            }
-            .font(.caption.monospacedDigit())
+    private func openChannels() {
+        guard canZap else { return }
+        hideWork?.cancel()
+        withAnimation(.easeInOut(duration: 0.25)) {
+            showControls = false
+            showChannels = true
         }
-    }
-
-    private var fraction: Double {
-        vlc.lengthMs > 0 ? Double(vlc.timeMs) / Double(vlc.lengthMs) : 0
     }
 
     private var tracksMenu: some View {
@@ -815,9 +835,14 @@ struct PlayerView: View {
     /// cuando se deja de cambiar (0,6 s): pasar canales rápido no dispara una ráfaga de conexiones
     /// (el proveedor banea la IP por eso).
     private func zap(_ step: Int) {
-        guard canZap, let i = channelIndex, let urlFor = item.channelURL else { return }
+        guard canZap, let i = channelIndex else { return }
         let n = item.channels.count
-        let next = ((i + step) % n + n) % n
+        zapTo(((i + step) % n + n) % n, delay: 0.6)
+    }
+
+    /// Cambia al canal `next` de la lista (desde el panel, casi sin espera).
+    private func zapTo(_ next: Int, delay: Double) {
+        guard canZap, let urlFor = item.channelURL, item.channels.indices.contains(next) else { return }
         channelIndex = next
         epg = []
         showControls = true
@@ -831,12 +856,13 @@ struct PlayerView: View {
             Task { await loadEPG() }
         }
         zapWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
+    /// Sin avisar a las pantallas de detrás (no se repintan con cada cambio de canal).
     private func rememberChannel() {
         guard item.isLive else { return }
-        if let c = currentChannel { session.lastChannelID = c.id } else if let id = item.liveStreamId { session.lastChannelID = id }
+        if let c = currentChannel { session.storeLastChannel(c.id) } else if let id = item.liveStreamId { session.storeLastChannel(id) }
     }
 
     @MainActor
@@ -845,7 +871,7 @@ struct PlayerView: View {
         // Guía del panel (una sola descarga para todos los canales) si la hay.
         if let c = currentChannel, session.guideEnabled {
             await session.refreshGuide()
-            let g = session.nowNext(c)
+            let g = GuideStore.shared.nowNext(c)
             if !g.isEmpty {
                 epg = g.map { EPGEntry(title: $0.title, start: $0.start, end: $0.end) }
                 return
@@ -912,5 +938,156 @@ private struct DoubleTapSeek: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// Barra de progreso (pelis y series): es lo único que se repinta con el tiempo del vídeo.
+private struct SeekArea: View {
+    @ObservedObject var clock: PlaybackClock
+    let hasNext: Bool
+    let onSeek: (Double) -> Void
+    let onNext: () -> Void
+    let onEditing: () -> Void
+    let onDone: () -> Void
+    @State private var scrub: Double?
+
+    private var fraction: Double {
+        clock.lengthMs > 0 ? Double(clock.timeMs) / Double(clock.lengthMs) : 0
+    }
+
+    var body: some View {
+        if clock.lengthMs > 0 {
+            let remaining = max(0, clock.lengthMs - clock.timeMs)
+            VStack(alignment: .trailing, spacing: 8) {
+                // En los créditos: pasar ya al siguiente capítulo.
+                if hasNext, remaining < 90_000, remaining > 0 {
+                    Button(action: onNext) {
+                        Label("Siguiente capítulo", systemImage: "forward.end.fill")
+                            .font(.subheadline.bold())
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                }
+                VStack(spacing: 4) {
+                    Slider(value: Binding(get: { scrub ?? fraction }, set: { scrub = $0 }), in: 0...1, onEditingChanged: { editing in
+                        onEditing()
+                        if !editing, let f = scrub {
+                            onSeek(f)
+                            scrub = nil
+                            onDone()
+                        }
+                    })
+                    .accessibilityLabel("Posición")
+                    HStack {
+                        Text(timeText(scrub.map { Int($0 * Double(clock.lengthMs)) } ?? clock.timeMs))
+                        Spacer()
+                        Text(timeText(clock.lengthMs))
+                    }
+                    .font(.caption.monospacedDigit())
+                }
+            }
+            .padding(.horizontal).padding(.bottom, 14)
+        }
+    }
+}
+
+/// Lista de canales dentro del reproductor (directo): logo, nombre, lo que echan y progreso.
+private struct ChannelPanel: View {
+    let channels: [LiveStream]
+    let current: Int?
+    let onPick: (Int) -> Void
+    let onClose: () -> Void
+    @ObservedObject private var guide = GuideStore.shared
+    @State private var query = ""
+
+    private var rows: [(offset: Int, element: LiveStream)] {
+        let all = Array(channels.enumerated())
+        let q = query.trimmingCharacters(in: .whitespaces).searchKey
+        guard !q.isEmpty else { return all }
+        return all.filter { $0.element.name.searchKey.contains(q) }
+    }
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Color.black.opacity(0.4)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onClose)
+            VStack(spacing: 10) {
+                HStack {
+                    Text("Canales").font(.headline)
+                    Text("\(channels.count)").font(.subheadline).foregroundStyle(.white.opacity(0.6))
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark").font(.subheadline.bold()).padding(8)
+                            .background(Color.white.opacity(0.12), in: Circle())
+                    }
+                    .accessibilityLabel("Cerrar lista")
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.6))
+                    TextField("Buscar canal", text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                    if !query.isEmpty {
+                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.6)) }
+                    }
+                }
+                .padding(.horizontal, 10).padding(.vertical, 8)
+                .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(rows, id: \.offset) { r in
+                                row(r.element, selected: r.offset == current)
+                                    .id(r.offset)
+                                    .onTapGesture { onPick(r.offset) }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        if let c = current { proxy.scrollTo(c, anchor: .center) }
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .frame(width: 340)
+            .frame(maxHeight: .infinity)
+            .background(.ultraThinMaterial, ignoresSafeAreaEdges: [.top, .bottom, .trailing])
+            .environment(\.colorScheme, .dark)
+        }
+        .foregroundStyle(.white)
+        .gesture(DragGesture(minimumDistance: 30).onEnded { v in
+            if v.translation.width > 60, abs(v.translation.width) > abs(v.translation.height) { onClose() }
+        })
+    }
+
+    private func row(_ s: LiveStream, selected: Bool) -> some View {
+        let now = guide.nowNext(s).first
+        return HStack(spacing: 10) {
+            RemoteImage(url: s.icon, contentMode: .fit)
+                .frame(width: 48, height: 32)
+                .background(Color.white.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Text(s.label.name).font(.subheadline.weight(selected ? .bold : .semibold)).lineLimit(1)
+                    if let t = s.label.tag { TagChip(text: t) }
+                }
+                if let now {
+                    Text(now.title).font(.caption).foregroundStyle(.white.opacity(0.7)).lineLimit(1)
+                    ProgramProgress(entry: now).frame(width: 90)
+                }
+            }
+            Spacer(minLength: 0)
+            if selected {
+                Image(systemName: "play.fill").font(.caption).foregroundStyle(Color.accentColor)
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 10).fill(selected ? Color.accentColor.opacity(0.3) : Color.clear))
+        .contentShape(Rectangle())
     }
 }
