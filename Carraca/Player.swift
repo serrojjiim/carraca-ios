@@ -413,6 +413,7 @@ struct PlayerView: View {
             }
             .ignoresSafeArea()
             if seekFlash != 0 { seekFlashView.transition(.opacity) }
+            MomentPlayerLayer()
             if let h = hud {
                 hudView(h)
                     .frame(maxHeight: .infinity, alignment: .top)

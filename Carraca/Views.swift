@@ -339,6 +339,8 @@ struct MainTabView: View {
                 .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
             }
         }
+        // adornos del tema (guirnaldas, emojis, imágenes) colocados desde el panel
+        .overlay { OrnamentLayer(tab: tabs.contains(tab) ? tab : "live", tabsOnTop: bannersAtBottom) }
         .onAppear {
             if let t = AppDelegate.pendingTab { tab = t; AppDelegate.pendingTab = nil }
         }

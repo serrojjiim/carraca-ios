@@ -8,7 +8,7 @@ import SwiftUI
 // Sin conexión se usa la última copia guardada (y las fechas se miran en el propio iPhone).
 
 struct SeasonTheme: Equatable {
-    enum Motion: String { case snow, fall, flutter, confetti, sparkle, off }
+    enum Motion: String { case snow, fall, flutter, confetti, sparkle, fireworks, off }
 
     let id: String
     let name: String
@@ -23,6 +23,11 @@ struct SeasonTheme: Equatable {
     var message: String
     var railTitle: String
     var keywords: [String]
+    /// Lo que se coloca encima (guirnaldas, emojis, imágenes): lo diseña el panel (Temas > Adornos).
+    var ornaments: [Ornament] = []
+    var particles = ParticleSettings()
+    /// Pestañas en las que salen los adornos (vacío = todas).
+    var screens: Set<String> = []
 
     var accent: Color { Color(uiColor: accentUI) }
 }
@@ -105,7 +110,10 @@ extension SeasonTheme {
 
 /// /tema.json del panel.
 struct ThemeConfig: Decodable {
-    struct Texts { var message: String?; var rail: String?; var keywords: [String]? }
+    struct Texts {
+        var message: String?; var rail: String?; var keywords: [String]?
+        var ornaments: [Ornament]?; var particles: ParticleSettings?; var screens: [String]?
+    }
     struct Span { let id: String; let from: String; let to: String }
 
     var mode = "no"
@@ -117,8 +125,10 @@ struct ThemeConfig: Decodable {
     var calendar: [Span] = []
     /// Temas creados en el panel ("Crear tema"): el diseño entero viene en el JSON.
     var custom: [String: SeasonTheme] = [:]
+    /// Momentos con día y hora (Nochevieja, un partido…).
+    var moments: [ThemeMoment] = []
 
-    enum CodingKeys: String, CodingKey { case modo, fijo, fijo_hasta, efectos, temas, calendario, custom }
+    enum CodingKeys: String, CodingKey { case modo, fijo, fijo_hasta, efectos, temas, calendario, custom, momentos }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -138,6 +148,9 @@ struct ThemeConfig: Decodable {
                         return nil
                     }
                 }
+                if let a = o["adornos"]?.arr { x.ornaments = Ornament.parse(a) }
+                if let p = o["particulas"]?.obj { x.particles = ParticleSettings.parse(p) }
+                if let a = o["pantallas"]?.arr { x.screens = a.compactMap(\.str) }
                 texts[id] = x
             }
         }
@@ -153,6 +166,9 @@ struct ThemeConfig: Decodable {
                 guard case .object(let o) = v, let t = Self.customTheme(id: id, o) else { continue }
                 custom[id] = t
             }
+        }
+        if let list = try? c.decode([JSONValue].self, forKey: .momentos) {
+            moments = ThemeMoment.parse(list)
         }
     }
 
@@ -177,6 +193,7 @@ struct ThemeConfig: Decodable {
         case "fly": motion = .flutter
         case "confetti": motion = .confetti
         case "rise": motion = .sparkle
+        case "fireworks": motion = .fireworks
         default: motion = .off
         }
         // Lo que cae: emojis cortos (un emoji puede ocupar varios "caracteres" de Swift si lleva tono, etc.)
@@ -225,9 +242,13 @@ final class ThemeStore: ObservableObject {
     @Published private(set) var effects = 2
     /// Reproductor abierto: la animación se para (ni se ve ni debe gastar batería).
     @Published var paused = false
+    /// Momento en marcha (Nochevieja, un partido…) y el siguiente, si está en su cuenta atrás.
+    @Published private(set) var moment: ThemeMoment?
+    @Published private(set) var upcoming: ThemeMoment?
 
     private var config: ThemeConfig?
     private var lastFetch = Date.distantPast
+    private var tick: Task<Void, Never>?
 
     private init() {
         if let d = UserDefaults.standard.data(forKey: Self.cacheKey) {
@@ -252,18 +273,51 @@ final class ThemeStore: ObservableObject {
         recompute()
     }
 
-    private func recompute() {
-        var t = config?.activeID(on: Date()).flatMap { SeasonTheme.catalog[$0] ?? config?.custom[$0] }
-        if var x = t, let o = config?.texts[x.id] {
+    private func lookup(_ id: String) -> SeasonTheme? {
+        guard var x = SeasonTheme.catalog[id] ?? config?.custom[id] else { return nil }
+        if let o = config?.texts[id] {
             if let m = o.message { x.message = m }
             if let r = o.rail, !r.isEmpty { x.railTitle = r }
             if let k = o.keywords { x.keywords = k }
+            if let a = o.ornaments { x.ornaments = a }
+            if let p = o.particles { x.particles = p }
+            if let s = o.screens { x.screens = Set(s) }
+        }
+        return x
+    }
+
+    private func recompute() {
+        let now = Date()
+        let moments = config?.moments ?? []
+        let active = moments.first { $0.start <= now && now < $0.end }
+        let next = moments.filter { $0.countdown > 0 && $0.start > now && $0.start.timeIntervalSince(now) <= $0.countdown }
+            .min { $0.start < $1.start }
+        var t = active?.theme.flatMap(lookup) ?? config?.activeID(on: now).flatMap(lookup)
+        if let m = active, !m.message.isEmpty || m.effect != .off {
+            var x = t ?? .neutral
+            if !m.message.isEmpty { x.message = m.message }
             t = x
         }
         if t != current { current = t }
+        if active != moment { moment = active }
+        if next != upcoming { upcoming = next }
         let e = config?.effects ?? 2
         if e != effects { effects = e }
         applyWindowTint()
+        scheduleTick(moments, now)
+    }
+
+    /// Despierta justo cuando empieza / acaba una cuenta atrás o un momento (las 00:00 en punto).
+    private func scheduleTick(_ moments: [ThemeMoment], _ now: Date) {
+        tick?.cancel()
+        let edges = moments.flatMap { [$0.start.addingTimeInterval(-$0.countdown), $0.start, $0.end] }.filter { $0 > now }
+        guard let first = edges.min() else { tick = nil; return }
+        let wait = min(3600, max(0.2, first.timeIntervalSince(now) + 0.05))
+        tick = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.recompute()
+        }
     }
 
     /// Lo de UIKit (alertas, menús, barra de pestañas) también con el color del tema.
@@ -326,6 +380,22 @@ struct SeasonBanner: View {
     var edge: Edge = .top
 
     var body: some View {
+        VStack(spacing: 0) {
+            if decor, let u = theme.upcoming {
+                CountdownLabel(moment: u)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(LinearGradient(colors: (theme.current ?? .neutral).colors,
+                                               startPoint: .leading, endPoint: .trailing))
+                    .transition(.move(edge: edge).combined(with: .opacity))
+            }
+            greeting
+        }
+        .animation(.easeInOut(duration: 0.3), value: theme.upcoming?.id)
+    }
+
+    @ViewBuilder
+    private var greeting: some View {
         if decor, let t = theme.current, !t.message.isEmpty, closed != theme.bannerKey {
             HStack(spacing: 10) {
                 Text(t.emoji).font(.title3)
@@ -356,13 +426,24 @@ struct SeasonDecor: View {
 
     var body: some View {
         if decor, theme.effects > 0, let t = theme.current {
+            let still = reduceMotion || ProcessInfo.processInfo.isLowPowerModeEnabled
+            let stop = theme.paused || phase != .active
+            let n = theme.effects >= 2 ? t.particles.count : (t.particles.count + 1) / 2
             ZStack(alignment: .top) {
-                LinearGradient(colors: [t.colors[0].opacity(0.30), t.colors[t.colors.count - 1].opacity(0.10), .clear],
-                               startPoint: .top, endPoint: .bottom)
-                    .frame(height: 260)
-                if t.motion != .off && !reduceMotion && !ProcessInfo.processInfo.isLowPowerModeEnabled {
-                    ParticleField(theme: t, count: theme.effects >= 2 ? 24 : 11,
-                                  paused: theme.paused || phase != .active)
+                if t.id != SeasonTheme.neutral.id {
+                    LinearGradient(colors: [t.colors[0].opacity(0.30), t.colors[t.colors.count - 1].opacity(0.10), .clear],
+                                   startPoint: .top, endPoint: .bottom)
+                        .frame(height: 260)
+                }
+                if t.motion != .off && n > 0 && !still {
+                    ParticleField(theme: t, settings: t.particles,
+                                  count: t.motion == .fireworks ? max(2, min(12, n / 3)) : n, paused: stop)
+                }
+                // el momento (fuegos a las 00:00, confeti por el gol…): por toda la pantalla
+                if let m = theme.moment, m.effect != .off, !still {
+                    ParticleField(theme: t, motion: m.effect, settings: ParticleSettings(count: 28, fullScreen: true),
+                                  count: m.effect == .fireworks ? (theme.effects >= 2 ? 7 : 4) : (theme.effects >= 2 ? 28 : 14),
+                                  paused: stop)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -378,8 +459,19 @@ struct SeasonDecor: View {
 /// Cada partícula sale de su número (sin estado): mismo dibujo siempre, nada que guardar.
 struct ParticleField: View {
     let theme: SeasonTheme
+    let motion: SeasonTheme.Motion
+    let settings: ParticleSettings
     let count: Int
     let paused: Bool
+
+    init(theme: SeasonTheme, motion: SeasonTheme.Motion? = nil, settings: ParticleSettings = .standard,
+         count: Int, paused: Bool) {
+        self.theme = theme
+        self.motion = motion ?? theme.motion
+        self.settings = settings
+        self.count = count
+        self.paused = paused
+    }
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { tl in
@@ -399,26 +491,28 @@ struct ParticleField: View {
         return v - v.rounded(.down)
     }
 
-    private func draw(_ ctx: inout GraphicsContext, _ size: CGSize, _ t: Double) {
+    private func draw(_ ctx: inout GraphicsContext, _ size: CGSize, _ t0: Double) {
         let w = Double(size.width)
-        let band = max(240, Double(size.height) * 0.48)
+        let band = settings.fullScreen ? Double(size.height) + 10 : max(240, Double(size.height) * 0.48)
         let nSym = theme.symbols.count
+        let t = t0 * settings.speed
+        let z = settings.size
         for i in 0..<count {
             let r = { (k: Double) -> Double in Self.rnd(i, k) }
-            switch theme.motion {
+            switch motion {
             case .snow, .fall:
-                let dur = (theme.motion == .snow ? 9 : 12) + r(1) * 9
+                let dur = (motion == .snow ? 9 : 12) + r(1) * 9
                 let p = (t / dur + r(2)).truncatingRemainder(dividingBy: 1)
                 let y = -24 + p * (band + 24)
                 let x = r(3) * w + sin(t * (0.35 + r(4) * 0.6) + r(5) * 6.28) * (10 + r(6) * 26)
                 let fade = min(1, p * 7) * pow(1 - p, 1.3)
-                let useSymbol = nSym > 0 && (theme.motion == .fall || r(8) < 0.2)
+                let useSymbol = nSym > 0 && (motion == .fall || r(8) < 0.2)
                 if useSymbol {
-                    let s = (theme.motion == .fall ? 15 : 11) + r(7) * 10
+                    let s = (motion == .fall ? 15 : 11) + r(7) * 10
                     symbol(&ctx, Int(r(9) * Double(nSym)) % nSym, x: x, y: y, size: s,
                            angle: t * (r(10) - 0.5) * 1.8 + r(11) * 6.28, opacity: 0.8 * fade)
                 } else {
-                    let d = 2 + r(7) * 3.5
+                    let d = (2 + r(7) * 3.5) * z
                     ctx.fill(Path(ellipseIn: CGRect(x: x - d / 2, y: y - d / 2, width: d, height: d)),
                              with: .color(.white.opacity(0.75 * fade)))
                 }
@@ -451,7 +545,7 @@ struct ParticleField: View {
                     c.translateBy(x: x, y: y)
                     c.rotate(by: .radians(t * (r(10) - 0.5) * 6 + r(11) * 6.28))
                     c.scaleBy(x: cos(t * (2 + r(6) * 3) + r(5) * 6.28), y: 1)    // da vueltas en el aire
-                    let wd = 4 + r(7) * 3, ht = 7 + r(9) * 5
+                    let wd = (4 + r(7) * 3) * z, ht = (7 + r(9) * 5) * z
                     c.fill(Path(roundedRect: CGRect(x: -wd / 2, y: -ht / 2, width: wd, height: ht), cornerRadius: 1),
                            with: .color(palette[Int(r(12) * Double(palette.count)) % palette.count]))
                 }
@@ -462,23 +556,80 @@ struct ParticleField: View {
                     var y = 30 + r(4) * band * 0.8 - (t * (4 + r(5) * 6)).truncatingRemainder(dividingBy: band * 0.5)
                     if y < 20 { y += band * 0.5 }
                     let tw = pow(max(0, sin(t * (0.9 + r(6) * 1.3) + r(7) * 6.28)), 4)
-                    star(&ctx, x: x, y: y, size: 5 + r(9) * 7, color: Color(hex: 0xFFD36B).opacity(0.9 * tw))
+                    star(&ctx, x: x, y: y, size: (5 + r(9) * 7) * z, color: Color(hex: 0xFFD36B).opacity(0.9 * tw))
                 } else {
                     // burbujas que suben
                     let dur = 10 + r(1) * 8
                     let p = (t / dur + r(2)).truncatingRemainder(dividingBy: 1)
                     let y = band - p * band
                     let x = r(3) * w + sin(t * (0.7 + r(4)) + r(5) * 6.28) * 10
-                    let d = 4 + r(6) * 9
+                    let d = (4 + r(6) * 9) * z
                     let op = sin(p * .pi) * 0.55
                     let rect = CGRect(x: x - d / 2, y: y - d / 2, width: d, height: d)
                     ctx.stroke(Path(ellipseIn: rect), with: .color(.white.opacity(op)), lineWidth: 1)
                     ctx.fill(Path(ellipseIn: CGRect(x: x - d * 0.22, y: y - d * 0.3, width: d * 0.18, height: d * 0.18)),
                              with: .color(.white.opacity(op)))
                 }
+            case .fireworks:
+                firework(&ctx, i, w: w, band: band, t: t, z: z)
             case .off:
                 return
             }
+        }
+    }
+
+    /// Un cohete que sube y estalla en chispas que caen y se apagan; cada vuelta, otro sitio y otro color.
+    private func firework(_ ctx: inout GraphicsContext, _ i: Int, w: Double, band: Double, t: Double, z: Double) {
+        let dur = 2.8 + Self.rnd(i, 1) * 1.8
+        let cyc = t / dur + Self.rnd(i, 2)
+        let p = cyc.truncatingRemainder(dividingBy: 1)
+        let n = Int(cyc.rounded(.down))
+        let rr = { (k: Double) -> Double in Self.rnd(i * 37 + n * 101, k) }
+        let palette: [Color] = [Color(hex: 0xFF4D4D), Color(hex: 0xFFC93C), Color(hex: 0x3EDC81), Color(hex: 0x3EA8FF),
+                                Color(hex: 0xFF7AE0), Color(hex: 0xFFFFFF), theme.accent]
+        let col = palette[Int(rr(5) * Double(palette.count)) % palette.count]
+        let cx = (0.1 + rr(3) * 0.8) * w
+        let cy = band * (0.12 + rr(4) * 0.36)
+        let launch = 0.28
+        if p < launch {
+            // subida: punto brillante con estela
+            let q = p / launch
+            let e = 1 - pow(1 - q, 2)
+            let y = band - (band - cy) * e
+            let x = cx + sin(q * 3 + rr(6) * 6) * 6
+            for k in 0..<5 {
+                let yy = y + Double(k) * 7
+                let a = (1 - Double(k) / 5) * 0.7
+                ctx.fill(Path(ellipseIn: CGRect(x: x - 1.5, y: yy - 1.5, width: 3, height: 3)),
+                         with: .color(Color(hex: 0xFFE7A8).opacity(a)))
+            }
+            return
+        }
+        let q = (p - launch) / (1 - launch)
+        let fade = pow(1 - q, 1.5)
+        if q < 0.1 {
+            let fr = 26 * z * (0.5 + q * 5)
+            ctx.fill(Path(ellipseIn: CGRect(x: cx - fr, y: cy - fr, width: fr * 2, height: fr * 2)),
+                     with: .color(col.opacity(0.35 * (1 - q / 0.1))))
+        }
+        let sparks = 22
+        let reach = (55 + rr(7) * 55) * z
+        let open = 1 - pow(1 - q, 2.6)
+        let drop = 38 * z * q * q
+        for k in 0..<sparks {
+            let ang = Double(k) / Double(sparks) * 2 * .pi + rr(8)
+            let sp = reach * (0.75 + Self.rnd(k, rr(9)) * 0.35)
+            let x = cx + cos(ang) * sp * open
+            let y = cy + sin(ang) * sp * open + drop
+            let d = 2.6 * z * (1 - q * 0.5)
+            let tw = 0.75 + 0.25 * sin(t * 30 + Double(k))
+            ctx.fill(Path(ellipseIn: CGRect(x: x - d / 2, y: y - d / 2, width: d, height: d)),
+                     with: .color(col.opacity(fade * tw)))
+            // estela corta hacia el centro
+            var line = Path()
+            line.move(to: CGPoint(x: cx + cos(ang) * sp * open * 0.86, y: cy + sin(ang) * sp * open * 0.86 + drop * 0.9))
+            line.addLine(to: CGPoint(x: x, y: y))
+            ctx.stroke(line, with: .color(col.opacity(fade * 0.45)), lineWidth: d * 0.5)
         }
     }
 
@@ -489,7 +640,8 @@ struct ParticleField: View {
         c.opacity = opacity
         c.translateBy(x: x, y: y)
         c.rotate(by: .radians(angle))
-        c.scaleBy(x: (flipX ? -1 : 1) * size / 22, y: scaleY * size / 22)
+        let s = size * settings.size
+        c.scaleBy(x: (flipX ? -1 : 1) * s / 22, y: scaleY * s / 22)
         c.draw(sym, at: .zero)
     }
 
