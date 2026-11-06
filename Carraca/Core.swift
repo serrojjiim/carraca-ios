@@ -800,13 +800,17 @@ final class XtreamAPI: @unchecked Sendable {
         guard !busy else { return }
         Task.detached(priority: .utility) { [self] in
             let ok = (try? await self.fetch(T.self, action, extra, key: key, maxAge: maxAge)) != nil
-            Self.lock.lock()
-            Self.refreshing.remove(key)
-            Self.lock.unlock()
+            Self.refreshDone(key)
             if ok {
                 await MainActor.run { NotificationCenter.default.post(name: Self.listRefreshed, object: name) }
             }
         }
+    }
+
+    private static func refreshDone(_ key: String) {
+        lock.lock()
+        refreshing.remove(key)
+        lock.unlock()
     }
 
     func authenticate() async throws -> AuthResponse {
