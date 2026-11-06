@@ -70,6 +70,7 @@ final class CatalogShelf<Item: CatalogTitle>: ObservableObject {
     init(lists: Set<String>, fetch: @escaping Fetch) {
         self.lists = lists
         self.fetch = fetch
+        // Sin referencia fuerte: al cerrar sesión el catálogo se libera y el bucle acaba en el siguiente aviso.
         watcher = Task { [weak self] in
             var pending: Task<Void, Never>?
             for await n in NotificationCenter.default.notifications(named: XtreamAPI.listRefreshed) {
@@ -85,8 +86,6 @@ final class CatalogShelf<Item: CatalogTitle>: ObservableObject {
             }
         }
     }
-
-    deinit { watcher?.cancel() }
 
     /// Carga si aún no hay nada. Si ya se está cargando (otra pestaña lo pidió), espera a esa carga.
     /// - force: vuelve a descargar (sin caché). - refresh: vuelve a leer la caché (se actualizó por detrás).
