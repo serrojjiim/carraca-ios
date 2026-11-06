@@ -179,8 +179,8 @@ final class Session: ObservableObject {
     @Published private(set) var watchlist: [String] = []
     private var watchlistKey: String { "carraca.milista." + favoritesKey }
 
-    static func listKey(movie id: Int) -> String { "m\(id)" }
-    static func listKey(series id: Int) -> String { "s\(id)" }
+    nonisolated static func listKey(movie id: Int) -> String { "m\(id)" }
+    nonisolated static func listKey(series id: Int) -> String { "s\(id)" }
 
     func inList(_ key: String) -> Bool { watchlist.contains(key) }
 
