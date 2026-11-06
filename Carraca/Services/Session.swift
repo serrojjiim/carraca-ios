@@ -1,4 +1,3 @@
-import Foundation
 import SwiftUI
 
 /// Versión privada (Ad Hoc): compilada con CARRACA_PRIVATE.
@@ -25,63 +24,6 @@ enum LoginError: LocalizedError {
     }
 }
 
-/// Qué reproducir y, si es VOD, con qué datos guardarlo en "Seguir viendo".
-struct PlayItem: Identifiable {
-    let id = UUID()
-    let url: URL
-    let title: String
-    var subtitle: String? = nil
-    var isLive = false
-    var liveStreamId: Int? = nil
-    var startMs = 0
-    var resume: ResumeTarget? = nil
-    /// Directo: lista desde la que se abrió el canal, para cambiar a anterior/siguiente.
-    var channels: [LiveStream] = []
-    var channelIndex = 0
-    var channelURL: ((LiveStream) -> URL)? = nil
-    /// Directo: todos los canales de la cuenta (para saltar a un canal reciente de otra categoría).
-    var allChannels: [LiveStream] = []
-    /// Series: lo que va después (siguiente capítulo automático al acabar).
-    var next: (() -> PlayItem?)? = nil
-}
-
-/// Preferencias de reproducción (Ajustes > Reproducción).
-enum PlaybackPrefs {
-    static let audioKey = "carraca.pref.audio"          // "" | castellano | latino | ingles
-    static let subsKey = "carraca.pref.subs"            // "" | off | castellano | ingles | forzados
-    static let autoNextKey = "carraca.pref.autonext"    // Bool (por defecto true)
-
-    static var audio: String { UserDefaults.standard.string(forKey: audioKey) ?? "" }
-    static var subs: String { UserDefaults.standard.string(forKey: subsKey) ?? "" }
-    static var autoNext: Bool { UserDefaults.standard.object(forKey: autoNextKey) as? Bool ?? true }
-
-    /// ¿El nombre de la pista encaja con la preferencia?
-    static func matches(_ name: String, _ pref: String) -> Bool {
-        let n = name.lowercased()
-        switch pref {
-        case "castellano":
-            if ["latino", "latam", "lat)", "mexic"].contains(where: { n.contains($0) }) { return false }
-            return ["castellano", "españa", "spain", "spa", "esp", "español", "spanish"].contains(where: { n.contains($0) })
-        case "latino":
-            return ["latino", "latam", "lat", "mexic"].contains(where: { n.contains($0) })
-        case "ingles":
-            return ["eng", "english", "inglés", "ingles"].contains(where: { n.contains($0) })
-        case "forzados":
-            return ["forz", "forced"].contains(where: { n.contains($0) })
-        default:
-            return false
-        }
-    }
-}
-
-struct ResumeTarget {
-    let type: String      // "movie" | "series"
-    let name: String      // nombre tal cual lo da el proveedor
-    let itemId: String
-    var season = 0
-    var episode = 0
-}
-
 /// Datos que llegan por el enlace carraca://login?s=…&u=…&p=…  (o &m3u=…)
 struct LoginPrefill: Equatable {
     var server = ""
@@ -104,10 +46,6 @@ final class Session: ObservableObject {
 
     var isLoggedIn: Bool { creds != nil }
     var isM3U: Bool { creds?.m3u != nil }
-
-    /// Pestaña "Eventos" (agenda pública de deportes del día): visible para todos los usuarios,
-    /// sin depender de qué servidor usen (nada oculto para la revisión de Apple).
-    var showsEvents: Bool { true }
 
     /// Cuenta Xtream del servidor Carraca (el mismo de la app Android).
     var isCarracaServer: Bool {
@@ -241,13 +179,8 @@ final class Session: ObservableObject {
         if on { Downloads.shared.removeWatched(self.isWatched(download:)) }
         guard let user = creds?.user else { return }
         if remoteResume {
-            let body: [String: Any] = ["user": user, "action": "visto", "on": on, "type": type, "name": name,
-                                       "season": season, "episode": episode]
-            var req = URLRequest(url: AppConfig.resumeURL)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-            URLSession.shared.dataTask(with: req).resume()
+            postResume(["user": user, "action": "visto", "on": on, "type": type, "name": name,
+                        "season": season, "episode": episode])
         } else {
             saveLocalWatched()
         }
@@ -417,12 +350,7 @@ final class Session: ObservableObject {
         resume.removeAll { $0.type == item.type && $0.name == item.name }
         guard let user = creds?.user else { return }
         if remoteResume {
-            let body: [String: Any] = ["user": user, "action": "borrar", "type": item.type, "name": item.name]
-            var req = URLRequest(url: AppConfig.resumeURL)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-            URLSession.shared.dataTask(with: req).resume()
+            postResume(["user": user, "action": "borrar", "type": item.type, "name": item.name])
         } else {
             LocalResume.remove(type: item.type, name: item.name)
         }
@@ -488,11 +416,15 @@ final class Session: ObservableObject {
             return
         }
 
-        let body: [String: Any] = [
+        postResume([
             "user": user, "type": r.type, "name": r.name, "id": r.itemId,
             "url": item.url.absoluteString, "season": r.season, "episode": r.episode,
             "position": timeMs, "duration": lengthMs, "pro": pro,
-        ]
+        ])
+    }
+
+    /// Escribe en resume.php del panel (progreso, visto, quitar). Sin esperar respuesta.
+    private func postResume(_ body: [String: Any]) {
         var req = URLRequest(url: AppConfig.resumeURL)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -501,54 +433,29 @@ final class Session: ObservableObject {
     }
 }
 
-// MARK: - Guía "ahora / después"
+// MARK: - Seguir viendo local (versión genérica: se guarda solo en el dispositivo)
 
-/// Guía de todos los canales (epg_now.php del panel). Va aparte de Session para que su
-/// actualización (cada 10 min) solo repinte las filas de canales; se descarga y se procesa
-/// fuera del hilo principal (son ~400 KB).
-@MainActor
-final class GuideStore: ObservableObject {
-    static let shared = GuideStore()
+enum LocalResume {
+    private static let key = "carraca.resume"
 
-    @Published private(set) var guide: [String: [GuideEntry]] = [:]
-    private var loaded = Date.distantPast
-
-    func reset() {
-        guide = [:]
-        loaded = .distantPast
+    static func load() -> [ResumeItem] {
+        guard let d = UserDefaults.standard.data(forKey: key),
+              let list = try? JSONDecoder().decode([ResumeItem].self, from: d) else { return [] }
+        return list
     }
 
-    /// Una petición para todos los canales; como mucho cada 10 minutos.
-    func refresh(enabled: Bool, force: Bool = false) async {
-        guard enabled, force || Date().timeIntervalSince(loaded) > 600 else { return }
-        loaded = Date()
-        guard let url = URL(string: AppConfig.panel + "/epg_now.php") else { return }
-        let parsed: [String: [GuideEntry]]? = await Task.detached(priority: .utility) {
-            guard let res = try? await URLSession.shared.data(from: url) else { return nil }
-            return GuideStore.parse(res.0)
-        }.value
-        if let parsed { guide = parsed }
-    }
-
-    nonisolated static func parse(_ data: Data) -> [String: [GuideEntry]]? {
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let chans = obj["c"] as? [String: [[Any]]] else { return nil }
-        var g: [String: [GuideEntry]] = [:]
-        g.reserveCapacity(chans.count)
-        for (id, list) in chans {
-            g[id] = list.compactMap { p in
-                guard p.count >= 3, let a = (p[0] as? NSNumber)?.doubleValue, let b = (p[1] as? NSNumber)?.doubleValue,
-                      let t = p[2] as? String else { return nil }
-                return GuideEntry(start: Date(timeIntervalSince1970: a), end: Date(timeIntervalSince1970: b), title: t)
-            }
+    static func upsert(_ item: ResumeItem) {
+        var list = load().filter { !($0.type == item.type && $0.name == item.name) }
+        if item.pro < 95 { list.insert(item, at: 0) }
+        if let d = try? JSONEncoder().encode(Array(list.prefix(20))) {
+            UserDefaults.standard.set(d, forKey: key)
         }
-        return g
     }
 
-    /// Lo que echan ahora (y después) en un canal.
-    func nowNext(_ s: LiveStream) -> [GuideEntry] {
-        guard let id = s.epgId, let list = guide[id] else { return [] }
-        let now = Date()
-        return Array(list.lazy.filter { $0.end > now }.prefix(2))
+    static func remove(type: String, name: String) {
+        let list = load().filter { !($0.type == type && $0.name == name) }
+        if let d = try? JSONEncoder().encode(list) { UserDefaults.standard.set(d, forKey: key) }
     }
+
+    static func clear() { UserDefaults.standard.removeObject(forKey: key) }
 }

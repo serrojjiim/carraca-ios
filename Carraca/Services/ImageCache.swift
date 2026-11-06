@@ -3,16 +3,24 @@ import CryptoKit
 
 /// Caché propia de carátulas y logos: memoria + disco, reducidas al tamaño en que se ven
 /// (menos memoria y scroll más fluido) y sin pedir dos veces la misma imagen a la vez.
-actor ImageLoader {
-    static let shared = ImageLoader()
-
-    /// En memoria: limitado por bytes (un fondo de 1400 px pesa como 10 pósteres), ~1/8 de la RAM y 150 MB como mucho.
-    nonisolated let memory: NSCache<NSString, UIImage> = {
+/// NSCache ya se puede usar desde varios hilos a la vez (lo dice Apple); este envoltorio solo lo declara.
+final class MemoryImages: @unchecked Sendable {
+    private let cache: NSCache<NSString, UIImage> = {
         let c = NSCache<NSString, UIImage>()
         c.countLimit = 400
         c.totalCostLimit = Int(min(Double(ProcessInfo.processInfo.physicalMemory) / 8, 150 * 1_048_576))
         return c
     }()
+
+    func object(forKey k: NSString) -> UIImage? { cache.object(forKey: k) }
+    func setObject(_ img: UIImage, forKey k: NSString, cost: Int) { cache.setObject(img, forKey: k, cost: cost) }
+}
+
+actor ImageLoader {
+    static let shared = ImageLoader()
+
+    /// En memoria: limitado por bytes (un fondo de 1400 px pesa como 10 pósteres), ~1/8 de la RAM y 150 MB como mucho.
+    nonisolated let memory = MemoryImages()
 
     /// Sin URLCache: las imágenes ya se guardan reducidas en disco (antes iban dos veces).
     private static let session: URLSession = {
