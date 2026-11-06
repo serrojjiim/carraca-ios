@@ -44,6 +44,8 @@ final class Downloads: NSObject, ObservableObject {
     @Published private(set) var speed: [String: Double] = [:]
     /// Conectado por Wi-Fi (o cable); si no, con "solo Wi-Fi" la descarga espera.
     @Published private(set) var onWiFi = true
+    /// Hay conexión a internet (sin ella, Mi Carraca abre directamente las Descargas).
+    @Published private(set) var online = true
     /// Pausa automática mientras el reproductor usa la conexión.
     private var pausedForPlayback = false
     private var current: URLSessionDownloadTask?
@@ -94,7 +96,11 @@ final class Downloads: NSObject, ObservableObject {
         }
         monitor.pathUpdateHandler = { [weak self] path in
             let wifi = path.status == .satisfied && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
-            Task { @MainActor in self?.onWiFi = wifi }
+            let online = path.status == .satisfied
+            Task { @MainActor in
+                self?.onWiFi = wifi
+                if self?.online != online { self?.online = online }
+            }
         }
         monitor.start(queue: DispatchQueue.global(qos: .utility))
         // reengancharse a la tarea que siguiera en marcha si la app se cerró
@@ -527,10 +533,10 @@ struct DownloadsList: View {
                 case .done:
                     Image(systemName: "play.circle.fill").font(.title2).foregroundStyle(Color.accentColor)
                 case .downloading, .queued:
-                    Button { downloads.pause(it.id) } label: { Image(systemName: "pause.circle").font(.title2) }
+                    Button { downloads.pause(it.id) } label: { Image(systemName: "pause.circle").font(.title2).hitTarget() }
                         .buttonStyle(.borderless).accessibilityLabel("Pausar")
                 case .paused, .failed:
-                    Button { downloads.resume(it.id) } label: { Image(systemName: "arrow.clockwise.circle").font(.title2) }
+                    Button { downloads.resume(it.id) } label: { Image(systemName: "arrow.clockwise.circle").font(.title2).hitTarget() }
                         .buttonStyle(.borderless).accessibilityLabel("Seguir descargando")
                 }
             }

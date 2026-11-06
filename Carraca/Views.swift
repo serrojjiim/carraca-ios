@@ -122,6 +122,7 @@ struct RootView: View {
             }
         }
         .overlay { SeasonDecor() }
+        .dynamicTypeSize(...DynamicTypeSize.accessibility3)
         .animation(.easeInOut(duration: 0.4), value: theme.current?.id)
         .seasonTint()
         .task { await ThemeStore.shared.refresh(force: true) }
@@ -299,7 +300,7 @@ struct MainTabView: View {
     private var tabs: [String] {
         var t = ["live"]
         if !session.isM3U { t += ["movies", "series"] }
-        if session.resumeEnabled { t.append("continue") }
+        if !session.isM3U { t.append("continue") }
         if session.showsEvents { t.append("events") }
         return t
     }
@@ -311,8 +312,9 @@ struct MainTabView: View {
                 MoviesView().tabItem { Label("Películas", systemImage: "film") }.tag("movies")
                 SeriesView().tabItem { Label("Series", systemImage: "rectangle.stack.badge.play") }.tag("series")
             }
-            if session.resumeEnabled {
-                ContinueView().tabItem { Label("Seguir", systemImage: "clock.arrow.circlepath") }.tag("continue")
+            // Mi Carraca: Seguir viendo, Mi lista y Descargas (siempre que haya pelis y series)
+            if !session.isM3U {
+                LibraryView().tabItem { Label("Mi Carraca", systemImage: "books.vertical") }.tag("continue")
             }
             if session.showsEvents {
                 EventsView().tabItem { Label("Eventos", systemImage: "sportscourt") }.tag("events")
@@ -489,10 +491,10 @@ private struct SettingsButton: ViewModifier {
         content
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    HStack(spacing: 4) {
-                        Button { search = true } label: { Image(systemName: "magnifyingglass") }
+                    HStack(spacing: 0) {
+                        Button { search = true } label: { Image(systemName: "magnifyingglass").hitTarget() }
                             .accessibilityLabel("Buscar en todo")
-                        Button { show = true } label: { Image(systemName: "gearshape") }
+                        Button { show = true } label: { Image(systemName: "gearshape").hitTarget() }
                             .accessibilityLabel("Ajustes")
                     }
                 }
@@ -504,6 +506,16 @@ private struct SettingsButton: ViewModifier {
 
 extension View {
     func withSettings() -> some View { modifier(SettingsButton()) }
+
+    /// Zona de toque de al menos 44 × 44 puntos (lo que pide Apple) aunque el icono sea pequeño.
+    func hitTarget() -> some View {
+        frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+    }
+
+    /// Lo mismo en los avisos finos (saludo, caducidad): la zona de toque crece sin hacer el aviso más alto.
+    func bannerHitTarget() -> some View {
+        frame(minWidth: 24, minHeight: 24).padding(10).contentShape(Rectangle()).padding(-10)
+    }
 }
 
 // MARK: - Componentes
@@ -718,7 +730,7 @@ struct ExpiryBanner: View {
                         d == 1 ? "Tu cuenta caduca mañana." : "Tu cuenta caduca en \(d) días.")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                Button { hiddenDay = today } label: { Image(systemName: "xmark").font(.caption.bold()) }
+                Button { hiddenDay = today } label: { Image(systemName: "xmark").font(.caption.bold()).bannerHitTarget() }
                     .accessibilityLabel("Cerrar aviso")
             }
             .foregroundStyle(.white)

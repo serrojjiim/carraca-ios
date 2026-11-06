@@ -235,6 +235,8 @@ struct EventsView: View {
     @State private var sport = ""
     @State private var now = Date()
     @State private var playing: PlayItem?
+    /// Columna de la hora: crece con el tamaño de letra del iPhone.
+    @ScaledMetric(relativeTo: .headline) private var timeWidth: CGFloat = 62
 
     private static let dayTitle: DateFormatter = {
         let f = DateFormatter()
@@ -274,6 +276,7 @@ struct EventsView: View {
             }
         }
         .onChange(of: session.reloadToken) { _ in Task { await reload(); await loadChannels(force: true) } }
+        .onListRefreshed(["live", "m3u"]) { await loadChannels(force: true) }
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
         .alert("Avisos desactivados", isPresented: $reminders.denied) {
             Button("Abrir Ajustes") {
@@ -365,7 +368,9 @@ struct EventsView: View {
                 Text(e.time).font(.system(.headline, design: .rounded).monospacedDigit())
                 if live {
                     Text("EN JUEGO")
-                        .font(.system(size: 9, weight: .heavy))
+                        .font(.caption2.weight(.heavy))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                         .padding(.horizontal, 5).padding(.vertical, 2)
                         .background(Capsule().fill(Color.red))
                         .foregroundStyle(.white)
@@ -373,7 +378,7 @@ struct EventsView: View {
                     Text("en \(m) min").font(.caption2).foregroundStyle(Color.accentColor)
                 }
             }
-            .frame(width: 58)
+            .frame(width: timeWidth)
             VStack(alignment: .leading, spacing: 3) {
                 Text((e.emoji.isEmpty ? "" : e.emoji + " ") + e.title).font(.subheadline.weight(.semibold)).lineLimit(2)
                 if !e.competition.isEmpty {
@@ -391,7 +396,8 @@ struct EventsView: View {
                     Image(systemName: reminded ? "bell.fill" : "bell")
                         .font(.body)
                         .foregroundStyle(reminded ? Color.yellow : Color.secondary)
-                        .frame(width: 36, height: 36)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
                 .accessibilityLabel(reminded ? "Quitar aviso" : "Avisarme 10 minutos antes")
@@ -431,8 +437,10 @@ struct EventsView: View {
         Image(systemName: "play.fill")
             .font(.subheadline.bold())
             .foregroundStyle(.white)
-            .frame(width: 36, height: 36)
+            .frame(width: 38, height: 38)
             .background(Circle().fill(Color.accentColor))
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
     }
 
     private func minutesTo(_ e: SportEvent) -> Int? {
@@ -475,6 +483,7 @@ struct EventsView: View {
         item.channels = playable
         item.channelIndex = playable.firstIndex(of: s) ?? 0
         item.channelURL = { c in urlFor(c)! }
+        item.allChannels = streams
         playing = item
     }
 }

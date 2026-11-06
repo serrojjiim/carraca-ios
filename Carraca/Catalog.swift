@@ -2,6 +2,33 @@ import SwiftUI
 
 // MARK: - Directo
 
+/// Una lista se ha actualizado por detrás (P1): las pestañas que la usan se recargan (de la caché ya nueva).
+/// Varias seguidas (categorías + lista) se juntan en una sola recarga.
+private struct ListRefreshWatcher: ViewModifier {
+    let names: Set<String>
+    let reload: () async -> Void
+    @State private var tick = 0
+
+    func body(content: Content) -> some View {
+        content
+            .onReceive(NotificationCenter.default.publisher(for: XtreamAPI.listRefreshed)) { n in
+                if let k = n.object as? String, names.contains(k) { tick += 1 }
+            }
+            .task(id: tick) {
+                guard tick > 0 else { return }
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                guard !Task.isCancelled else { return }
+                await reload()
+            }
+    }
+}
+
+extension View {
+    func onListRefreshed(_ names: Set<String>, reload: @escaping () async -> Void) -> some View {
+        modifier(ListRefreshWatcher(names: names, reload: reload))
+    }
+}
+
 struct LiveView: View {
     @EnvironmentObject private var session: Session
     @State private var categories: [Category] = []
@@ -47,6 +74,7 @@ struct LiveView: View {
         .fullScreenCover(item: $playing) { PlayerView(item: $0) }
         .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
         .onChange(of: session.favorites) { _ in favs = streams.filter { session.isFavorite($0) } }
+        .onListRefreshed(["live", "live_cat", "m3u"]) { await load() }
     }
 
     /// iPad: categorías a la izquierda; canales (con vista previa) a la derecha.
@@ -105,10 +133,47 @@ struct LiveView: View {
         .refreshable { await load(force: true) }
     }
 
-    /// "Seguir viendo · <último canal>" (abre el canal con su categoría para poder cambiar).
+    /// "Seguir viendo · <último canal>" (abre el canal con su categoría para poder cambiar) y,
+    /// debajo, los otros canales vistos hace poco.
     @ViewBuilder
     private var lastChannelButton: some View {
         if query.isEmpty, let id = session.lastChannelID, let ch = byID[id] {
+            let more = session.recentChannelIDs.filter { $0 != id }.compactMap { byID[$0] }
+            VStack(alignment: .leading, spacing: 10) {
+                lastChannelCard(ch)
+                if !more.isEmpty { recentStrip(more) }
+            }
+        }
+    }
+
+    /// Canales recientes en fila: logo y nombre; un toque lo abre.
+    private func recentStrip(_ list: [LiveStream]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Recientes").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(list) { c in
+                        Button { play(c, in: byCategory[c.categoryId] ?? [c]) } label: {
+                            VStack(spacing: 5) {
+                                RemoteImage(url: c.icon, contentMode: .fit)
+                                    .padding(5)
+                                    .frame(width: 76, height: 48)
+                                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                                Text(c.label.name).font(.caption2).lineLimit(1).frame(width: 76)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Ver \(c.label.name)")
+                        .favoriteActions(c)
+                    }
+                }
+            }
+        }
+    }
+
+    private func lastChannelCard(_ ch: LiveStream) -> some View {
+        Group {
             Button { play(ch, in: byCategory[ch.categoryId] ?? [ch]) } label: {
                 HStack(spacing: 12) {
                     RemoteImage(url: ch.icon, contentMode: .fit)
@@ -297,6 +362,7 @@ struct LiveView: View {
         item.channels = playable
         item.channelIndex = playable.firstIndex(of: s) ?? 0
         item.channelURL = { c in urlFor(c)! }
+        item.allChannels = streams
         return item
     }
 
@@ -321,6 +387,10 @@ struct ChannelListView: View {
     @State private var pending: Task<Void, Never>?
     @State private var epg: [EPGEntry] = []
     @State private var playing: PlayItem?
+    /// Búsqueda en la categoría: nombres preparados una vez y búsqueda al dejar de escribir.
+    @State private var index = SearchIndex<LiveStream>()
+    @State private var indexVersion = 0
+    @State private var hits: [LiveStream]?
 
     private static let hm: DateFormatter = {
         let f = DateFormatter()
@@ -344,9 +414,10 @@ struct ChannelListView: View {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(Color.accentColor)
-                            .padding(8)
+                            .hitTarget()
                     }
                     .buttonStyle(.borderless)
+                    .accessibilityLabel("Pantalla completa")
                 }
                 .contentShape(Rectangle())
                 .onTapGesture { tap(s, in: list) }
@@ -360,6 +431,14 @@ struct ChannelListView: View {
         .searchable(text: $query, prompt: "Buscar en \(title)")
         .onDisappear { stopPreview() }
         .onChange(of: phase) { p in if p != .active { stopPreview() } }
+        .task(id: gridKey(channels)) {
+            index = await makeSearchIndex(channels) { $0.name }
+            indexVersion += 1
+        }
+        .task(id: "\(query)|\(indexVersion)") {
+            if query.trimmingCharacters(in: .whitespaces).isEmpty { hits = nil; return }
+            if let r = await debouncedSearch(query, in: index, limit: 5000) { hits = r }
+        }
         .fullScreenCover(item: $playing, onDismiss: {
             if let s = selected { schedulePreview(s, delay: 0.6) }
         }) { PlayerView(item: $0) }
@@ -401,8 +480,10 @@ struct ChannelListView: View {
                             .foregroundStyle(.white)
                             .padding(8)
                             .background(.ultraThinMaterial, in: Circle())
+                            .hitTarget()
                     }
-                    .padding(8)
+                    .accessibilityLabel("Cerrar vista previa")
+                    .padding(2)
                 }
                 .frame(maxWidth: 560)
 
@@ -428,7 +509,7 @@ struct ChannelListView: View {
     }
 
     private var filtered: [LiveStream] {
-        query.isEmpty ? channels : channels.filter { $0.name.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil }
+        query.trimmingCharacters(in: .whitespaces).isEmpty ? channels : (hits ?? channels)
     }
 
     private func range(_ e: EPGEntry) -> String {
@@ -605,12 +686,17 @@ struct MoviesView: View {
 
     /// iPad: categoría elegida en el menú lateral (Inicio = filas de carátulas).
     @State private var selected: Category? = Category.home
+    /// iPhone: saltar a una categoría desde la lista (N3).
+    @State private var path = NavigationPath()
+    @State private var jump = false
+    @State private var jumpTo: Category?
 
     var body: some View {
         Group {
             if hsize == .regular { splitBody } else { stackBody }
         }
         .task { if movies.isEmpty { await load() } }
+        .onListRefreshed(["vod", "vod_cat"]) { await load() }
         .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
         .task(id: theme.current) { await updateSeasonal() }
         .onChange(of: session.reloadToken) { _ in
@@ -637,9 +723,9 @@ struct MoviesView: View {
         }
     }
 
-    /// iPhone: como siempre.
+    /// iPhone: como siempre, con un botón para saltar a una categoría sin bajar por todas las filas.
     private var stackBody: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             main
                 .navigationTitle("Películas")
                 .searchable(text: $query, prompt: "Buscar película")
@@ -647,7 +733,20 @@ struct MoviesView: View {
                     VodGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                 }
                 .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        if !categories.isEmpty && query.isEmpty {
+                            Button { jump = true } label: { Image(systemName: "list.bullet.indent") }
+                                .accessibilityLabel("Ir a una categoría")
+                        }
+                    }
+                }
                 .withSettings()
+        }
+        .sheet(isPresented: $jump, onDismiss: {
+            if let c = jumpTo { path.append(c); jumpTo = nil }
+        }) {
+            CategoryJumpSheet(title: "Categorías de películas", categories: categories, counts: counts) { jumpTo = $0 }
         }
     }
 
@@ -896,7 +995,8 @@ struct VodGrid: View {
 struct MovieDetailView: View {
     let movie: VodStream
     @EnvironmentObject private var session: Session
-    @ObservedObject private var downloads = Downloads.shared
+    /// Sin observar: el estado de la descarga lo pinta MovieDownloadRow (que es lo único que cambia).
+    private var downloads: Downloads { Downloads.shared }
     @State private var info: VodInfo?
     @State private var playing: PlayItem?
     @State private var showDownload = false
@@ -1013,24 +1113,7 @@ struct MovieDetailView: View {
     @ViewBuilder
     private var downloadButton: some View {
         if !session.isM3U {
-            if let d = downloads.item("m\(movie.id)") {
-                HStack {
-                    switch d.state {
-                    case .done: Label("Descargada · \(byteText(d.total))", systemImage: "arrow.down.circle.fill").foregroundStyle(.green)
-                    case .downloading: Label("Descargando \(Int(d.progress * 100)) %", systemImage: "arrow.down.circle")
-                    default: Label("En descargas", systemImage: "arrow.down.circle.dotted")
-                    }
-                    Spacer()
-                    Button(role: .destructive) { downloads.remove(d.id) } label: { Image(systemName: "trash") }
-                        .accessibilityLabel("Borrar descarga")
-                }
-                .font(.subheadline)
-            } else {
-                Button { showDownload = true } label: {
-                    Label("Descargar", systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered).controlSize(.large)
-            }
+            MovieDownloadRow(id: "m\(movie.id)") { showDownload = true }
         }
     }
 
@@ -1044,6 +1127,34 @@ struct MovieDetailView: View {
         }
         playing = PlayItem(url: api.movieURL(movie), title: movie.title, startMs: ms,
                            resume: ResumeTarget(type: "movie", name: movie.name, itemId: String(movie.id)))
+    }
+}
+
+/// Estado de la descarga de una peli (lo único de la ficha que cambia mientras se descarga).
+private struct MovieDownloadRow: View {
+    let id: String
+    let onDownload: () -> Void
+    @ObservedObject private var downloads = Downloads.shared
+
+    var body: some View {
+        if let d = downloads.item(id) {
+            HStack {
+                switch d.state {
+                case .done: Label("Descargada · \(byteText(d.total))", systemImage: "arrow.down.circle.fill").foregroundStyle(.green)
+                case .downloading: Label("Descargando \(Int(d.progress * 100)) %", systemImage: "arrow.down.circle")
+                default: Label("En descargas", systemImage: "arrow.down.circle.dotted")
+                }
+                Spacer()
+                Button(role: .destructive) { downloads.remove(d.id) } label: { Image(systemName: "trash").hitTarget() }
+                    .accessibilityLabel("Borrar descarga")
+            }
+            .font(.subheadline)
+        } else {
+            Button(action: onDownload) {
+                Label("Descargar", systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered).controlSize(.large)
+        }
     }
 }
 
@@ -1081,12 +1192,17 @@ struct SeriesView: View {
 
     /// iPad: categoría elegida en el menú lateral (Inicio = filas de carátulas).
     @State private var selected: Category? = Category.home
+    /// iPhone: saltar a una categoría desde la lista (N3).
+    @State private var path = NavigationPath()
+    @State private var jump = false
+    @State private var jumpTo: Category?
 
     var body: some View {
         Group {
             if hsize == .regular { splitBody } else { stackBody }
         }
         .task { if items.isEmpty { await load() } }
+        .onListRefreshed(["series", "series_cat"]) { await load() }
         .task(id: query) { if let r = await debouncedSearch(query, in: index, limit: 300) { hits = r } }
         .task(id: theme.current) { await updateSeasonal() }
         .onChange(of: session.reloadToken) { _ in
@@ -1113,9 +1229,9 @@ struct SeriesView: View {
         }
     }
 
-    /// iPhone: como siempre.
+    /// iPhone: como siempre, con un botón para saltar a una categoría sin bajar por todas las filas.
     private var stackBody: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             main
                 .navigationTitle("Series")
                 .searchable(text: $query, prompt: "Buscar serie")
@@ -1123,7 +1239,20 @@ struct SeriesView: View {
                     SeriesGrid(items: byCategory[cat.id] ?? []).navigationTitle(cat.label.name)
                 }
                 .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        if !categories.isEmpty && query.isEmpty {
+                            Button { jump = true } label: { Image(systemName: "list.bullet.indent") }
+                                .accessibilityLabel("Ir a una categoría")
+                        }
+                    }
+                }
                 .withSettings()
+        }
+        .sheet(isPresented: $jump, onDismiss: {
+            if let c = jumpTo { path.append(c); jumpTo = nil }
+        }) {
+            CategoryJumpSheet(title: "Categorías de series", categories: categories, counts: counts) { jumpTo = $0 }
         }
     }
 
@@ -1277,6 +1406,8 @@ struct FeaturedCarousel<Item: Hashable>: View {
     @State private var page = 0
     @State private var loaded: [String: String] = [:]
     @State private var asked: Set<String> = []
+    /// Con el reproductor encima no se ve: ni pasa solo ni pide imágenes.
+    @ObservedObject private var presence = PlayerPresence.shared
 
     var body: some View {
         TabView(selection: $page) {
@@ -1290,7 +1421,8 @@ struct FeaturedCarousel<Item: Hashable>: View {
         }
         .tabViewStyle(.page(indexDisplayMode: items.count > 1 ? .always : .never))
         .frame(height: height)
-        .task(id: page) {
+        .task(id: presence.open ? -1 : page) {
+            guard !presence.open else { return }
             await fetchBackdrop(page)
             guard items.count > 1 else { return }
             try? await Task.sleep(nanoseconds: 7_000_000_000)
@@ -1726,6 +1858,8 @@ struct EpisodeRow: View {
     let episode: Episode
     let progress: Double?
     var watched = false
+    /// Crece con el tamaño de letra del iPhone (con letra grande "12" no cabía).
+    @ScaledMetric(relativeTo: .headline) private var numberWidth: CGFloat = 34
 
     private var thumb: String? { episode.image.flatMap { $0.hasPrefix("http") ? $0 : nil } }
 
@@ -1762,7 +1896,7 @@ struct EpisodeRow: View {
                         Text("\(episode.number)").font(.headline.monospacedDigit()).foregroundStyle(Color.accentColor)
                     }
                 }
-                .frame(width: 34)
+                .frame(width: numberWidth)
             }
             VStack(alignment: .leading, spacing: 4) {
                 Text(thumb != nil || watched ? "\(episode.number). \(episode.title.cleanTitle)" : episode.title.cleanTitle)
@@ -1780,83 +1914,92 @@ struct EpisodeRow: View {
     }
 }
 
-// MARK: - Seguir viendo
+// MARK: - Mi Carraca (Seguir viendo, Mi lista y Descargas)
 
-struct ContinueView: View {
+/// Todo lo "tuyo" en una pestaña: lo que dejaste a medias, lo guardado para luego y lo descargado.
+/// Sale siempre que haya pelis y series (antes las Descargas solo se veían si había "Seguir viendo").
+/// Sin internet se abre directamente en Descargas.
+struct LibraryView: View {
+    enum Part: String, CaseIterable, Identifiable {
+        case resume = "Seguir viendo", list = "Mi lista", downloads = "Descargas"
+        var id: String { rawValue }
+    }
+
     @EnvironmentObject private var session: Session
-    /// Pestaña: Seguir viendo o Descargas.
-    @State private var section = 0
+    @State private var chosen: Part?
     @State private var allSeries: [SeriesItem] = []
-    /// Carátula de cada peli por nombre (de la lista de pelis, que está en caché).
-    @State private var movieIcons: [String: String] = [:]
+    @State private var seriesByID: [Int: SeriesItem] = [:]
     @State private var movies: [String: VodStream] = [:]
+    @State private var moviesByID: [Int: VodStream] = [:]
+    @State private var listsLoaded = false
     @State private var playing: PlayItem?
     @State private var detail: SeriesItem?
     /// Preparando la reproducción (fichas de series: hace falta la lista de capítulos).
     @State private var opening: String?
 
+    private var parts: [Part] { session.resumeEnabled ? Part.allCases : [.list, .downloads] }
+    private var part: Part { chosen.flatMap { parts.contains($0) ? $0 : nil } ?? parts[0] }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-            Picker("Sección", selection: $section) {
-                Text("Seguir viendo").tag(0)
-                Text("Descargas").tag(1)
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
-            if section == 1 {
-                DownloadsList()
-            } else {
-            List(session.resume) { item in
-                row(item)
-                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                        Button(role: .destructive) { session.removeResume(item) } label: {
-                            Label("Quitar", systemImage: "trash")
-                        }
-                    }
-            }
-            .listStyle(.plain)
-            .overlay {
-                if session.resume.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: "clock.arrow.circlepath").font(.largeTitle).foregroundStyle(.secondary)
-                        Text("Aquí aparecerá lo que dejes a medias.").foregroundStyle(.secondary)
-                    }
+                Picker("Sección", selection: Binding(get: { part }, set: { chosen = $0 })) {
+                    ForEach(parts) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                switch part {
+                case .resume: resumeList
+                case .list: myList
+                case .downloads: DownloadsList()
                 }
             }
-            .refreshable { await session.refreshResume() }
-            }
-            }
-            .navigationTitle(section == 1 ? "Descargas" : "Seguir viendo")
+            .navigationTitle(part.rawValue)
             .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
+            .navigationDestination(for: VodStream.self) { MovieDetailView(movie: $0) }
             .navigationDestination(isPresented: Binding(get: { detail != nil }, set: { if !$0 { detail = nil } })) {
                 if let s = detail { SeriesDetailView(series: s) }
             }
             .withSettings()
         }
+        // sin conexión (y con algo descargado): directamente a Descargas
+        .onReceive(Downloads.shared.$online.removeDuplicates()) { on in
+            if !on, Downloads.shared.items.contains(where: { $0.state == .done }) { chosen = .downloads }
+        }
         .task {
             await session.refreshResume()
-            if allSeries.isEmpty { allSeries = (try? await session.api?.series()) ?? [] }
-            if movieIcons.isEmpty, let list = try? await session.api?.vodStreams() {
-                var d: [String: String] = [:]
-                var byName: [String: VodStream] = [:]
-                for m in list {
-                    if let i = m.icon, d[m.name] == nil { d[m.name] = i }
-                    if byName[m.name] == nil { byName[m.name] = m }
+            await loadLists()
+        }
+        .onListRefreshed(["vod", "series"]) { await loadLists() }
+        .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
+    }
+
+    // MARK: Seguir viendo
+
+    private var resumeList: some View {
+        List(session.resume) { item in
+            row(item)
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) { session.removeResume(item) } label: {
+                        Label("Quitar", systemImage: "trash")
+                    }
                 }
-                movieIcons = d
-                movies = byName
+        }
+        .listStyle(.plain)
+        .overlay {
+            if session.resume.isEmpty {
+                emptyState("clock.arrow.circlepath", "Aquí aparecerá lo que dejes a medias.")
             }
         }
-        .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
+        .refreshable { await session.refreshResume() }
     }
 
     /// Un toque: sigue donde se dejó (capítulo incluido). La ficha de la serie, con el botón (i).
     @ViewBuilder
     private func row(_ item: ResumeItem) -> some View {
         let series = item.type == "series" ? findSeries(item.name) : nil
-        let image = series?.cover ?? (item.type == "movie" ? movieIcons[item.name] : nil)
+        let image = series?.cover ?? (item.type == "movie" ? movies[item.name]?.icon : nil)
         HStack(spacing: 4) {
             Button {
                 guard opening == nil else { return }
@@ -1875,7 +2018,7 @@ struct ContinueView: View {
             .foregroundStyle(.primary)
             if let s = series {
                 Button { detail = s } label: {
-                    Image(systemName: "info.circle").font(.title3).foregroundStyle(Color.accentColor).padding(8)
+                    Image(systemName: "info.circle").font(.title3).foregroundStyle(Color.accentColor).hitTarget()
                 }
                 .buttonStyle(.borderless)
                 .accessibilityLabel("Ver ficha de la serie")
@@ -1891,6 +2034,111 @@ struct ContinueView: View {
     private func findSeries(_ name: String) -> SeriesItem? {
         let base = name.seriesBaseName
         return allSeries.first { $0.name == name || $0.name == base }
+    }
+
+    // MARK: Mi lista
+
+    private enum Saved: Identifiable {
+        case movie(VodStream), series(SeriesItem)
+        var id: String {
+            switch self {
+            case .movie(let m): return Session.listKey(movie: m.id)
+            case .series(let s): return Session.listKey(series: s.id)
+            }
+        }
+    }
+
+    private var saved: [Saved] {
+        session.watchlist.compactMap { k in
+            guard let id = Int(k.dropFirst()) else { return nil }
+            if k.hasPrefix("m") { return moviesByID[id].map(Saved.movie) }
+            if k.hasPrefix("s") { return seriesByID[id].map(Saved.series) }
+            return nil
+        }
+    }
+
+    private var myList: some View {
+        let list = saved
+        return List {
+            ForEach(list) { it in
+                Group {
+                    switch it {
+                    case .movie(let m):
+                        NavigationLink(value: m) {
+                            savedRow(m.title, m.icon, kind: "Película", year: m.year,
+                                     watched: session.isWatched(movie: m.name))
+                        }
+                    case .series(let s):
+                        NavigationLink(value: s) { savedRow(s.title, s.cover, kind: "Serie", year: s.year, watched: false) }
+                    }
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) { session.toggleList(it.id) } label: {
+                        Label("Quitar", systemImage: "bookmark.slash")
+                    }
+                }
+            }
+        }
+        .listStyle(.plain)
+        .overlay {
+            if list.isEmpty {
+                if !listsLoaded && !session.watchlist.isEmpty {
+                    ProgressView()
+                } else {
+                    emptyState("bookmark", "Guarda pelis y series para luego con \"Mi lista\" en su ficha.")
+                }
+            }
+        }
+    }
+
+    private func savedRow(_ title: String, _ image: String?, kind: String, year: Int?, watched: Bool) -> some View {
+        HStack(spacing: 14) {
+            Color.clear
+                .frame(width: 64, height: 96)
+                .overlay { RemoteImage(url: image, title: title) }
+                .overlay(alignment: .topTrailing) { if watched { WatchedBadge().padding(4) } }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).lineLimit(2).foregroundStyle(.primary)
+                Text([kind, year.map(String.init)].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func emptyState(_ icon: String, _ text: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon).font(.largeTitle).foregroundStyle(.secondary)
+            Text(text).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }
+        .padding()
+    }
+
+    // MARK: Datos
+
+    /// Carátulas y fichas: de las listas de pelis y series (en caché; no se descarga nada si ya estaban).
+    @MainActor
+    private func loadLists() async {
+        guard let api = session.api else { listsLoaded = true; return }
+        let s = (try? await api.series()) ?? []
+        let v = (try? await api.vodStreams()) ?? []
+        let maps = await Task.detached(priority: .userInitiated) { () -> ([Int: SeriesItem], [String: VodStream], [Int: VodStream]) in
+            var sid: [Int: SeriesItem] = [:]
+            for x in s where sid[x.id] == nil { sid[x.id] = x }
+            var byName: [String: VodStream] = [:]
+            var vid: [Int: VodStream] = [:]
+            for m in v {
+                if byName[m.name] == nil || (byName[m.name]?.icon == nil && m.icon != nil) { byName[m.name] = m }
+                if vid[m.id] == nil { vid[m.id] = m }
+            }
+            return (sid, byName, vid)
+        }.value
+        allSeries = s
+        seriesByID = maps.0
+        movies = maps.1
+        moviesByID = maps.2
+        listsLoaded = true
     }
 }
 
@@ -2061,4 +2309,53 @@ func debouncedSearch<T>(_ query: String, in index: SearchIndex<T>, limit: Int) a
     try? await Task.sleep(nanoseconds: 250_000_000)
     if Task.isCancelled { return nil }
     return index.search(q, limit: limit)
+}
+
+// MARK: - Saltar a una categoría (iPhone)
+
+/// Lista de categorías (con buscador) para ir directamente a una sin bajar por todas las filas.
+struct CategoryJumpSheet: View {
+    let title: String
+    let categories: [Category]
+    let counts: [String: Int]
+    let onPick: (Category) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+
+    private var filtered: [Category] {
+        let q = query.trimmingCharacters(in: .whitespaces).searchKey
+        return q.isEmpty ? categories : categories.filter { $0.label.name.searchKey.contains(q) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List(filtered) { c in
+                Button {
+                    onPick(c)
+                    dismiss()
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(c.label.name).lineLimit(1).foregroundStyle(.primary)
+                        if let t = c.label.tag { TagChip(text: t) }
+                        Spacer(minLength: 6)
+                        Text("\(counts[c.id] ?? 0)").font(.caption).foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                    }
+                    .contentShape(Rectangle())
+                }
+            }
+            .listStyle(.plain)
+            .overlay {
+                if filtered.isEmpty { Text("Ninguna categoría con ese nombre.").foregroundStyle(.secondary) }
+            }
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Buscar categoría")
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cerrar") { dismiss() } }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .seasonTint()
+    }
 }

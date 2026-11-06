@@ -28,7 +28,9 @@ actor ImageLoader {
         guard let cg = img.cgImage else { return Int(img.size.width * img.size.height * img.scale * img.scale * 4) }
         return cg.bytesPerRow * cg.height
     }
-    private var tasks: [String: Task<UIImage?, Never>] = [:]
+    /// Descargas en marcha y cuántas pantallas las esperan: si ya no las espera nadie (la carátula
+    /// salió de la pantalla al deslizar rápido) se cancelan y dejan sitio a las que sí se ven.
+    private var tasks: [String: (task: Task<UIImage?, Never>, waiters: Int, token: UUID)] = [:]
 
     static let dir: URL = {
         let u = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -46,16 +48,43 @@ actor ImageLoader {
         memory.object(forKey: Self.key(url, maxPixel) as NSString)
     }
 
-    func image(_ url: URL, maxPixel: Int) async -> UIImage? {
+    func image(_ url: URL, maxPixel: Int, priority: TaskPriority = .userInitiated) async -> UIImage? {
         let k = Self.key(url, maxPixel)
         if let m = memory.object(forKey: k as NSString) { return m }
-        if let t = tasks[k] { return await t.value }
-        let t = Task<UIImage?, Never>.detached(priority: .utility) { await Self.load(url, key: k, maxPixel: maxPixel) }
-        tasks[k] = t
-        let img = await t.value
-        tasks[k] = nil
-        if let img { memory.setObject(img, forKey: k as NSString, cost: Self.cost(img)) }
+        let entry: (task: Task<UIImage?, Never>, token: UUID)
+        if let e = tasks[k] {
+            tasks[k]?.waiters += 1
+            entry = (e.task, e.token)
+        } else {
+            let t = Task<UIImage?, Never>.detached(priority: priority) { await Self.load(url, key: k, maxPixel: maxPixel) }
+            let token = UUID()
+            tasks[k] = (t, 1, token)
+            entry = (t, token)
+        }
+        let img = await withTaskCancellationHandler {
+            await entry.task.value
+        } onCancel: {
+            Task { await self.release(k, entry.token) }
+        }
+        if let img {
+            memory.setObject(img, forKey: k as NSString, cost: Self.cost(img))
+            if tasks[k]?.token == entry.token { tasks[k] = nil }
+        } else if !Task.isCancelled, tasks[k]?.token == entry.token {
+            tasks[k] = nil
+        }
         return img
+    }
+
+    /// Una pantalla ha dejado de esperar esta imagen; si era la última, se cancela la descarga.
+    private func release(_ k: String, _ token: UUID) {
+        guard var e = tasks[k], e.token == token else { return }
+        e.waiters -= 1
+        if e.waiters <= 0 {
+            e.task.cancel()
+            tasks[k] = nil
+        } else {
+            tasks[k] = e
+        }
     }
 
     private static func load(_ url: URL, key: String, maxPixel: Int) async -> UIImage? {
@@ -67,7 +96,8 @@ actor ImageLoader {
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
             return await img.byPreparingForDisplay() ?? img
         }
-        guard let res = try? await session.data(from: url),
+        guard !Task.isCancelled,
+              let res = try? await session.data(from: url), !Task.isCancelled,
               (res.1 as? HTTPURLResponse)?.statusCode ?? 200 < 400,
               let img = UIImage(data: res.0) else { return nil }
         // reducir al tamaño en que se pinta (un póster no necesita 2000 px)
@@ -86,7 +116,7 @@ actor ImageLoader {
     nonisolated func prefetch(_ urls: [String?], maxPixel: Int = 480) {
         let list = urls.compactMap { $0.flatMap(URL.init(string:)) }
         Task.detached(priority: .background) {
-            for u in list { _ = await self.image(u, maxPixel: maxPixel) }
+            for u in list { _ = await self.image(u, maxPixel: maxPixel, priority: .utility) }
         }
     }
 

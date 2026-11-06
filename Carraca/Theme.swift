@@ -402,7 +402,7 @@ struct SeasonBanner: View {
                 Text(t.message).font(.subheadline.weight(.semibold)).lineLimit(2)
                 Spacer(minLength: 6)
                 Button { withAnimation(.easeInOut(duration: 0.25)) { closed = theme.bannerKey } } label: {
-                    Image(systemName: "xmark").font(.caption.bold()).padding(6)
+                    Image(systemName: "xmark").font(.caption.bold()).bannerHitTarget()
                 }
                 .accessibilityLabel("Cerrar saludo")
             }

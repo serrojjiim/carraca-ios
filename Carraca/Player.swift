@@ -15,6 +15,13 @@ final class PlaybackClock: ObservableObject {
     @Published var lengthMs = 0
 }
 
+/// ¿Hay un reproductor a pantalla completa? Lo de detrás (carrusel de portada) se queda quieto.
+@MainActor
+final class PlayerPresence: ObservableObject {
+    static let shared = PlayerPresence()
+    @Published var open = false
+}
+
 /// Envoltorio del motor VLC (reproduce TS, MKV, AVI…).
 final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let player = VLCMediaPlayer()
@@ -66,6 +73,12 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     /// Salto en curso: a dónde se ha pedido ir (VLC tarda un momento en confirmar la nueva posición).
     private var seekTarget: Int?
     private var seekStarted = Date.distantPast
+    /// Vigilante de atascos: VLC a veces se queda "cargando" sin dar error (imagen congelada).
+    private var watchdog: Timer?
+    private var lastProgress = Date()
+    private var lastSeenTime = -1
+    private var lastStallRestart = Date.distantPast
+    private var stallRestarts = 0
 
     override init() {
         super.init()
@@ -73,6 +86,10 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func start(url: URL, startMs: Int, live: Bool, muted: Bool = false) {
+        if url != self.url {
+            lastStallRestart = .distantPast
+            stallRestarts = 0
+        }
         self.url = url
         self.live = live
         self.muted = muted
@@ -89,6 +106,39 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if startMs > 0 { media.addOption(":start-time=\(Double(startMs) / 1000.0)") }
         player.media = media
         player.play()
+        lastProgress = Date()
+        lastSeenTime = -1
+        startWatchdog()
+    }
+
+    /// Si el vídeo no avanza (15 s en directo, 25 s en pelis y series) sin estar en pausa, se vuelve
+    /// a abrir solo, como mucho una vez por minuto (el proveedor banea las ráfagas de conexiones).
+    /// Tras 3 intentos seguidos sin que avance, se da por fallido y se explica por qué.
+    /// No vigila la vista previa (sin sonido) para no abrir conexiones de más.
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        guard !muted else { watchdog = nil; return }
+        let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.checkStall() }
+        RunLoop.main.add(t, forMode: .common)
+        watchdog = t
+    }
+
+    private func checkStall() {
+        guard !halted, !failed, !ended, let url else { return }
+        if player.state == .paused { lastProgress = Date(); return }
+        let stalled = Date().timeIntervalSince(lastProgress)
+        guard stalled > (live ? 15 : 25), Date().timeIntervalSince(lastStallRestart) > 60 else { return }
+        if stallRestarts >= 3 {
+            failed = true
+            buffering = false
+            playing = false
+            watchdog?.invalidate()
+            diagnose(url)
+            return
+        }
+        stallRestarts += 1
+        lastStallRestart = Date()
+        start(url: url, startMs: live ? 0 : (seekTarget ?? timeMs), live: live, muted: muted)
     }
 
     func restart() {
@@ -127,12 +177,18 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func stop() {
+        watchdog?.invalidate()
+        watchdog = nil
         player.delegate = nil
         player.stop()
     }
 
+    deinit { watchdog?.invalidate() }
+
     /// Para la reproducción pero deja el controlador listo para otro start() (vista previa).
     func halt() {
+        watchdog?.invalidate()
+        watchdog = nil
         halted = true
         retries = 0
         player.stop()
@@ -250,6 +306,12 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let t = Int(self.player.time.intValue)
+            if t != self.lastSeenTime {
+                // avanza: el vigilante se queda tranquilo
+                if self.lastSeenTime >= 0 { self.stallRestarts = 0 }
+                self.lastSeenTime = t
+                self.lastProgress = Date()
+            }
             if let target = self.seekTarget {
                 // Hasta que VLC llega al destino, sus tiempos son del sitio viejo: no los enseñamos.
                 if abs(t - target) > 15_000 && Date().timeIntervalSince(self.seekStarted) < 20 { return }
@@ -346,6 +408,8 @@ struct PlayerView: View {
     @State private var showChannels = false
     /// Directo: posición del canal actual dentro de item.channels (para anterior/siguiente).
     @State private var channelIndex: Int?
+    /// Canales vistos hace poco (arriba en la lista de canales), calculados al abrirla.
+    @State private var recentStreams: [LiveStream] = []
     @State private var zapWork: DispatchWorkItem?
     /// Siguiente capítulo: cuenta atrás al acabar.
     @State private var upNext: PlayItem?
@@ -449,11 +513,12 @@ struct PlayerView: View {
                 controls.transition(.opacity)
             }
             if showChannels {
-                ChannelPanel(channels: item.channels, current: channelIndex,
+                ChannelPanel(channels: item.channels, current: channelIndex, recents: recentStreams,
                              onPick: { i in
                                  withAnimation(.easeInOut(duration: 0.25)) { showChannels = false }
                                  if i != channelIndex { zapTo(i, delay: 0.25) }
                              },
+                             onPickStream: { pick($0) },
                              onClose: { withAnimation(.easeInOut(duration: 0.25)) { showChannels = false } })
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                     .zIndex(2)
@@ -465,6 +530,7 @@ struct PlayerView: View {
         .persistentSystemOverlays(.hidden)
         .onAppear {
             ThemeStore.shared.paused = true      // la decoración de temporada no se ve: que no gaste
+            PlayerPresence.shared.open = true
             UIApplication.shared.isIdleTimerDisabled = true
             setOrientation(.landscape)
             if item.isLive, !item.channels.isEmpty { channelIndex = item.channelIndex }
@@ -486,6 +552,7 @@ struct PlayerView: View {
             tearDownRemoteCommands()
             Downloads.shared.resumeAfterPlayback()
             ThemeStore.shared.paused = false
+            PlayerPresence.shared.open = false
             UIApplication.shared.isIdleTimerDisabled = false
             setOrientation(.portrait)
         }
@@ -628,6 +695,7 @@ struct PlayerView: View {
 
     private func openChannels() {
         guard canZap else { return }
+        recentStreams = recents()
         hideWork?.cancel()
         withAnimation(.easeInOut(duration: 0.25)) {
             showControls = false
@@ -1020,9 +1088,32 @@ struct PlayerView: View {
         zapTo(((i + step) % n + n) % n, delay: 0.6)
     }
 
+    /// Canales recientes que se pueden abrir desde aquí (sin el que se está viendo).
+    private func recents() -> [LiveStream] {
+        let pool = item.allChannels.isEmpty ? item.channels : item.allChannels
+        var byID: [Int: LiveStream] = [:]
+        for c in pool where byID[c.id] == nil { byID[c.id] = c }
+        let now = currentChannel?.id
+        return session.recentChannelIDs.filter { $0 != now }.compactMap { byID[$0] }
+    }
+
+    /// Canal reciente: si está en la lista actual se cambia ahí; si es de otra categoría,
+    /// la lista pasa a ser la de su categoría (anterior / siguiente siguen teniendo sentido).
+    private func pick(_ ch: LiveStream) {
+        withAnimation(.easeInOut(duration: 0.25)) { showChannels = false }
+        if let i = item.channels.firstIndex(of: ch) {
+            if i != channelIndex { zapTo(i, delay: 0.25) }
+            return
+        }
+        let same = item.allChannels.filter { $0.categoryId == ch.categoryId }
+        let list = same.contains(ch) ? same : [ch]
+        item.channels = list
+        zapTo(list.firstIndex(of: ch) ?? 0, delay: 0.25)
+    }
+
     /// Cambia al canal `next` de la lista (desde el panel, casi sin espera).
     private func zapTo(_ next: Int, delay: Double) {
-        guard canZap, let urlFor = item.channelURL, item.channels.indices.contains(next) else { return }
+        guard item.isLive, let urlFor = item.channelURL, item.channels.indices.contains(next) else { return }
         channelIndex = next
         epg = []
         showControls = true
@@ -1171,20 +1262,26 @@ private struct SeekArea: View {
     }
 }
 
-/// Lista de canales dentro del reproductor (directo): logo, nombre, lo que echan y progreso.
+/// Lista de canales dentro del reproductor (directo): recientes arriba y, debajo, logo, nombre,
+/// lo que echan y progreso.
 private struct ChannelPanel: View {
     let channels: [LiveStream]
     let current: Int?
+    let recents: [LiveStream]
     let onPick: (Int) -> Void
+    let onPickStream: (LiveStream) -> Void
     let onClose: () -> Void
     @ObservedObject private var guide = GuideStore.shared
     @State private var query = ""
+    /// Búsqueda: índice preparado una vez (no se normalizan miles de nombres en cada letra).
+    @State private var index = SearchIndex<Int>()
+    @State private var indexReady = false
+    @State private var hits: [Int]?
 
     private var rows: [(offset: Int, element: LiveStream)] {
-        let all = Array(channels.enumerated())
-        let q = query.trimmingCharacters(in: .whitespaces).searchKey
-        guard !q.isEmpty else { return all }
-        return all.filter { $0.element.name.searchKey.contains(q) }
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty, let hits else { return Array(channels.enumerated()) }
+        return hits.compactMap { i in channels.indices.contains(i) ? (i, channels[i]) : nil }
     }
 
     var body: some View {
@@ -1201,9 +1298,11 @@ private struct ChannelPanel: View {
                     Button(action: onClose) {
                         Image(systemName: "xmark").font(.subheadline.bold()).padding(8)
                             .background(Color.white.opacity(0.12), in: Circle())
+                            .hitTarget()
                     }
                     .accessibilityLabel("Cerrar lista")
                 }
+                if query.isEmpty && !recents.isEmpty { recentRow }
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.6))
                     TextField("Buscar canal", text: $query)
@@ -1212,6 +1311,7 @@ private struct ChannelPanel: View {
                         .submitLabel(.search)
                     if !query.isEmpty {
                         Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.6)) }
+                            .accessibilityLabel("Borrar búsqueda")
                     }
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
@@ -1242,6 +1342,38 @@ private struct ChannelPanel: View {
         .gesture(DragGesture(minimumDistance: 30).onEnded { v in
             if v.translation.width > 60, abs(v.translation.width) > abs(v.translation.height) { onClose() }
         })
+        .task {
+            let list = channels
+            index = await makeSearchIndex(Array(list.indices)) { list[$0].name }
+            indexReady = true
+        }
+        .task(id: query + (indexReady ? "|1" : "|0")) {
+            if let r = await debouncedSearch(query, in: index, limit: 5000) { hits = r }
+        }
+    }
+
+    /// Últimos canales vistos (de cualquier categoría).
+    private var recentRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Recientes").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.6))
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(recents) { s in
+                        Button { onPickStream(s) } label: {
+                            VStack(spacing: 4) {
+                                RemoteImage(url: s.icon, contentMode: .fit)
+                                    .padding(4)
+                                    .frame(width: 64, height: 40)
+                                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                                Text(s.label.name).font(.caption2).lineLimit(1).frame(width: 64)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(s.label.name)
+                    }
+                }
+            }
+        }
     }
 
     private func row(_ s: LiveStream, selected: Bool) -> some View {

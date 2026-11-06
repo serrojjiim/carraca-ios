@@ -39,6 +39,8 @@ struct PlayItem: Identifiable {
     var channels: [LiveStream] = []
     var channelIndex = 0
     var channelURL: ((LiveStream) -> URL)? = nil
+    /// Directo: todos los canales de la cuenta (para saltar a un canal reciente de otra categoría).
+    var allChannels: [LiveStream] = []
     /// Series: lo que va después (siguiente capítulo automático al acabar).
     var next: (() -> PlayItem?)? = nil
 }
@@ -161,7 +163,16 @@ final class Session: ObservableObject {
     /// reproductor en cada cambio de canal); al cerrar el reproductor se avisa una sola vez.
     func storeLastChannel(_ id: Int) {
         UserDefaults.standard.set(id, forKey: lastChannelKey)
+        var r = recentChannelIDs.filter { $0 != id }
+        r.insert(id, at: 0)
+        UserDefaults.standard.set(Array(r.prefix(Self.recentMax)), forKey: recentKey)
     }
+
+    // MARK: Canales recientes (los últimos vistos, el primero es el último)
+
+    static let recentMax = 8
+    private var recentKey: String { "carraca.recentch." + favoritesKey }
+    var recentChannelIDs: [Int] { UserDefaults.standard.array(forKey: recentKey) as? [Int] ?? lastChannelID.map { [$0] } ?? [] }
 
     // MARK: Mi lista (pelis y series para ver luego, en el dispositivo)
 
@@ -351,20 +362,39 @@ final class Session: ObservableObject {
         return try await fetchM3U(url, force: force)
     }
 
+    private var m3uRefreshing = false
+
     private func fetchM3U(_ url: URL, force: Bool) async throws -> [LiveStream] {
         // Hash estable (djb2): hashValue cambia en cada arranque.
         let h = url.absoluteString.utf8.reduce(UInt64(5381)) { ($0 &<< 5) &+ $0 &+ UInt64($1) }
         let key = "m3u_" + String(h, radix: 16)
-        if !force, let d = DiskCache.read(key, maxAge: XtreamAPI.listAge), let t = String(data: d, encoding: .utf8) {
-            return M3U.parse(t)
+        // La lista guardada se enseña al momento; si ha caducado, se actualiza por detrás.
+        if !force, let hit = DiskCache.readDated(key, maxAge: .infinity) {
+            let data = hit.0
+            let list = await Task.detached(priority: .userInitiated) { M3U.parse(data: data) }.value
+            if !list.isEmpty {
+                if Date().timeIntervalSince(hit.1) >= XtreamAPI.listAge && !m3uRefreshing {
+                    m3uRefreshing = true
+                    Task {
+                        let ok = (try? await downloadM3U(url, key: key)) != nil
+                        m3uRefreshing = false
+                        if ok { NotificationCenter.default.post(name: XtreamAPI.listRefreshed, object: "m3u") }
+                    }
+                }
+                return list
+            }
         }
+        return try await downloadM3U(url, key: key)
+    }
+
+    private func downloadM3U(_ url: URL, key: String) async throws -> [LiveStream] {
         let (data, resp) = try await URLSession.shared.data(from: url)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        guard code == 200, let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
-            throw APIError.http(code)
-        }
+        guard code == 200 else { throw APIError.http(code) }
+        let list = await Task.detached(priority: .userInitiated) { M3U.parse(data: data) }.value
+        guard !list.isEmpty else { throw LoginError.badM3U }
         DiskCache.write(key, data)
-        return M3U.parse(text)
+        return list
     }
 
     func logout() {
