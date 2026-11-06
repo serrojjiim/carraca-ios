@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 import MediaPlayer
 import MobileVLCKit
 
@@ -51,6 +52,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     /// Sincronización (ms; positivo = más tarde).
     @Published var subtitleDelayMs = 0 { didSet { player.currentVideoSubTitleDelay = subtitleDelayMs * 1000 } }
     @Published var audioDelayMs = 0 { didSet { player.currentAudioPlaybackDelay = audioDelayMs * 1000 } }
+    /// Velocidad (pelis y series).
+    @Published var rate: Float = 1 { didSet { player.rate = rate } }
     /// Idioma/subtítulos preferidos: se aplican una vez por vídeo, al empezar.
     private var prefsApplied = false
 
@@ -228,6 +231,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                     if self.subtitleDelayMs != 0 { self.player.currentVideoSubTitleDelay = self.subtitleDelayMs * 1000 }
                     if self.audioDelayMs != 0 { self.player.currentAudioPlaybackDelay = self.audioDelayMs * 1000 }
                 }
+                if self.rate != 1 && self.player.rate != self.rate { self.player.rate = self.rate }
             case .paused:
                 self.playing = false
             case .error:
@@ -349,6 +353,21 @@ struct PlayerView: View {
     /// Temporizador de apagado.
     @State private var sleepEnd: Date?
     @State private var sleepAtEnd = false
+    /// Gestos: brillo (mitad izquierda) y volumen (derecha) deslizando en vertical; en el centro,
+    /// hacia abajo, se cierra. En horizontal, cambiar de canal (directo).
+    private enum DragMode { case brightness, volume, close, horizontal }
+    @State private var dragMode: DragMode?
+    @State private var dragStart: CGFloat = 0
+    @State private var closeOffset: CGFloat = 0
+    /// Brillo que había al abrir (se devuelve al salir).
+    @State private var originalBrightness: CGFloat?
+    /// Indicador de brillo / volumen.
+    @State private var hud: PlayerHUD?
+    @State private var hudWork: DispatchWorkItem?
+    /// Candado: la pantalla no responde a toques (para verlo en la cama, con niños…).
+    @State private var locked = false
+    @State private var showUnlock = false
+    @State private var unlockWork: DispatchWorkItem?
     /// Doble toque a un lado: segundos saltados (se acumulan si se repite), para el aviso en pantalla.
     @State private var seekFlash = 0
     @State private var flashWork: DispatchWorkItem?
@@ -369,34 +388,55 @@ struct PlayerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VLCVideoView(controller: vlc).ignoresSafeArea()
+            // volumen del sistema (invisible): permite subir/bajar deslizando
+            SystemVolumeHost().frame(width: 1, height: 1).opacity(0.02).allowsHitTesting(false)
+            VLCVideoView(controller: vlc)
+                .ignoresSafeArea()
+                .scaleEffect(1 - min(closeOffset, 400) / 1600)
+                .offset(y: closeOffset)
             // Capa que recibe los toques encima del vídeo (muestra/oculta los controles).
             // Pelis y series: doble toque a la izquierda / derecha = atrasar / adelantar 10 s.
             GeometryReader { geo in
                 Color.clear
                     .contentShape(Rectangle())
-                    .modifier(DoubleTapSeek(enabled: !item.isLive) { p in
+                    .modifier(DoubleTapSeek(enabled: !item.isLive && !locked) { p in
                         doubleTapSeek(forward: p.x > geo.size.width / 2)
                     })
                     .onTapGesture {
+                        if locked { flashUnlock(); return }
                         withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
                         if showControls { scheduleHide() }
                     }
-                    // Directo: deslizar a izquierda/derecha cambia de canal;
-                    // desde el borde derecho hacia dentro, abre la lista de canales.
-                    .gesture(DragGesture(minimumDistance: 40).onEnded { v in
-                        let dx = v.translation.width, dy = v.translation.height
-                        guard canZap, abs(dx) > abs(dy) * 1.5 else { return }
-                        if v.startLocation.x > geo.size.width - 70, dx < -50 {
-                            openChannels()
-                            return
-                        }
-                        guard abs(dx) > 80 else { return }
-                        zap(dx < 0 ? 1 : -1)
-                    })
+                    .gesture(DragGesture(minimumDistance: 12)
+                        .onChanged { v in dragChanged(v, size: geo.size) }
+                        .onEnded { v in dragEnded(v, size: geo.size) })
             }
             .ignoresSafeArea()
             if seekFlash != 0 { seekFlashView.transition(.opacity) }
+            if let h = hud {
+                hudView(h)
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 28)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+            if locked && showUnlock {
+                Button {
+                    locked = false
+                    showUnlock = false
+                    showControlsBriefly()
+                } label: {
+                    Label("Desbloquear", systemImage: "lock.fill")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 18).padding(.vertical, 12)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .padding(.top, 30)
+                .transition(.opacity)
+                .zIndex(3)
+            }
             if vlc.buffering && !vlc.failed && upNext == nil {
                 ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false)
             }
@@ -404,7 +444,7 @@ struct PlayerView: View {
                 upNextCard(next)
             } else if vlc.failed {
                 failure
-            } else if showControls && !showChannels {
+            } else if showControls && !showChannels && !locked && dragMode != .close {
                 controls.transition(.opacity)
             }
             if showChannels {
@@ -436,6 +476,7 @@ struct PlayerView: View {
         }
         .onDisappear {
             report()
+            if let b = originalBrightness { UIScreen.main.brightness = b }
             // el último canal se guardó sin avisar; ahora sí, para "Seguir viendo · canal"
             if item.isLive { session.objectWillChange.send() }
             // Ajustes > Descargas > Borrar lo ya visto
@@ -463,6 +504,11 @@ struct PlayerView: View {
             }
         }
         .onChange(of: vlc.playing) { _ in updateNowPlaying() }
+        .onChange(of: vlc.rate) { _ in updateNowPlaying() }
+        // botones de volumen del iPhone: el aviso del sistema no sale (por el control invisible), sale el nuestro
+        .onReceive(AVAudioSession.sharedInstance().publisher(for: \.outputVolume).dropFirst()) { v in
+            if dragMode != .volume { showHUD(volumeIcon(Double(v)), Double(v)) }
+        }
         .task { await loadEPG() }
     }
 
@@ -494,6 +540,9 @@ struct PlayerView: View {
                             }
                         }
                         if epg.count > 1 { Text("Después: \(epg[1].title)").font(.caption).opacity(0.75).lineLimit(1) }
+                        if !item.isLive && vlc.rate != 1 {
+                            Label("Velocidad \(rateText(vlc.rate))", systemImage: "speedometer").font(.caption).opacity(0.8)
+                        }
                         if let end = sleepEnd {
                             Label("Se apaga a las \(end.formatted(date: .omitted, time: .shortened))", systemImage: "moon.zzz")
                                 .font(.caption).opacity(0.8)
@@ -502,6 +551,19 @@ struct PlayerView: View {
                         }
                     }
                     Spacer()
+                    Button {
+                        locked = true
+                        hideWork?.cancel()
+                        withAnimation(.easeInOut(duration: 0.2)) { showControls = false }
+                        flashUnlock()
+                    } label: {
+                        Image(systemName: "lock.open")
+                            .font(.title3)
+                            .frame(width: 22, height: 22)
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .accessibilityLabel("Bloquear pantalla")
                     if canZap {
                         Button { openChannels() } label: {
                             Image(systemName: "list.bullet")
@@ -613,9 +675,23 @@ struct PlayerView: View {
         .accessibilityLabel("Audio y subtítulos")
     }
 
-    /// Formato de imagen y temporizador de apagado.
+    private func rateText(_ r: Float) -> String {
+        r == 1 ? "normal" : (String(format: "%g", r).replacingOccurrences(of: ".", with: ",") + "×")
+    }
+
+    /// Formato de imagen, velocidad y temporizador de apagado.
     private var optionsMenu: some View {
         Menu {
+            if !item.isLive {
+                Section("Velocidad") {
+                    ForEach([Float(0.5), 0.75, 1, 1.25, 1.5, 2], id: \.self) { r in
+                        Button { vlc.rate = r } label: {
+                            let t = r == 1 ? "Normal" : rateText(r)
+                            if vlc.rate == r { Label(t, systemImage: "checkmark") } else { Text(t) }
+                        }
+                    }
+                }
+            }
             Section("Imagen") {
                 ForEach(VLCController.AspectMode.allCases, id: \.self) { m in
                     Button { vlc.aspect = m } label: {
@@ -757,6 +833,109 @@ struct PlayerView: View {
     private func showControlsBriefly() {
         withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
         scheduleHide()
+    }
+
+    // MARK: Gestos (brillo, volumen, cerrar, cambiar de canal) y candado
+
+    private func dragChanged(_ v: DragGesture.Value, size: CGSize) {
+        guard !locked, !showChannels, upNext == nil else { return }
+        let dx = v.translation.width, dy = v.translation.height
+        if dragMode == nil {
+            guard max(abs(dx), abs(dy)) > 12 else { return }
+            if abs(dy) > abs(dx) {
+                let third = size.width / 3
+                if v.startLocation.x < third {
+                    dragMode = .brightness
+                    dragStart = UIScreen.main.brightness
+                    if originalBrightness == nil { originalBrightness = dragStart }
+                } else if v.startLocation.x > third * 2 {
+                    dragMode = .volume
+                    dragStart = CGFloat(AVAudioSession.sharedInstance().outputVolume)
+                } else {
+                    dragMode = .close
+                }
+            } else {
+                dragMode = .horizontal
+            }
+        }
+        let span = max(200, size.height * 0.75)
+        guard let mode = dragMode else { return }
+        switch mode {
+        case .brightness:
+            let b = min(1, max(0, dragStart - dy / span))
+            UIScreen.main.brightness = b
+            showHUD(b < 0.35 ? "sun.min.fill" : "sun.max.fill", Double(b))
+        case .volume:
+            let vol = min(1, max(0, dragStart - dy / span))
+            SystemVolume.set(Float(vol))
+            showHUD(volumeIcon(Double(vol)), Double(vol))
+        case .close:
+            closeOffset = max(0, dy)
+        default:
+            break
+        }
+    }
+
+    private func dragEnded(_ v: DragGesture.Value, size: CGSize) {
+        defer { dragMode = nil }
+        guard !locked else { return }
+        let dx = v.translation.width, dy = v.translation.height
+        guard let mode = dragMode else { return }
+        switch mode {
+        case .close:
+            if dy > 140 || v.predictedEndTranslation.height > 320 {
+                dismiss()
+            } else {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { closeOffset = 0 }
+            }
+        case .horizontal:
+            // Directo: deslizar cambia de canal; desde el borde derecho hacia dentro, la lista de canales.
+            guard canZap, abs(dx) > abs(dy) * 1.5 else { return }
+            if v.startLocation.x > size.width - 70, dx < -50 {
+                openChannels()
+                return
+            }
+            guard abs(dx) > 80 else { return }
+            zap(dx < 0 ? 1 : -1)
+        default:
+            break
+        }
+    }
+
+    private func volumeIcon(_ v: Double) -> String {
+        v <= 0.001 ? "speaker.slash.fill" : v < 0.34 ? "speaker.wave.1.fill" : v < 0.67 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"
+    }
+
+    private func showHUD(_ icon: String, _ value: Double) {
+        if hud == nil {
+            withAnimation(.easeOut(duration: 0.15)) { hud = PlayerHUD(icon: icon, value: value) }
+        } else {
+            hud = PlayerHUD(icon: icon, value: value)
+        }
+        hudWork?.cancel()
+        let w = DispatchWorkItem { withAnimation(.easeIn(duration: 0.25)) { hud = nil } }
+        hudWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: w)
+    }
+
+    private func hudView(_ h: PlayerHUD) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: h.icon).font(.headline).frame(width: 24)
+            ProgressView(value: h.value).tint(.white).frame(width: 140)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 18).padding(.vertical, 12)
+        .background(.ultraThinMaterial, in: Capsule())
+        .environment(\.colorScheme, .dark)
+    }
+
+    /// Con el candado puesto, un toque enseña el botón de desbloquear un momento.
+    private func flashUnlock() {
+        withAnimation(.easeInOut(duration: 0.2)) { showUnlock = true }
+        unlockWork?.cancel()
+        let w = DispatchWorkItem { withAnimation(.easeInOut(duration: 0.3)) { showUnlock = false } }
+        unlockWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: w)
     }
 
     // MARK: Lógica
@@ -914,7 +1093,7 @@ struct PlayerView: View {
 
     private func updateNowPlaying() {
         var info: [String: Any] = [MPMediaItemPropertyTitle: title,
-                                   MPNowPlayingInfoPropertyPlaybackRate: vlc.playing ? 1.0 : 0.0,
+                                   MPNowPlayingInfoPropertyPlaybackRate: vlc.playing ? Double(vlc.rate) : 0.0,
                                    MPNowPlayingInfoPropertyIsLiveStream: item.isLive]
         if let s = item.subtitle { info[MPMediaItemPropertyArtist] = s }
         if !item.isLive, vlc.lengthMs > 0 {
@@ -1090,4 +1269,33 @@ private struct ChannelPanel: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(selected ? Color.accentColor.opacity(0.3) : Color.clear))
         .contentShape(Rectangle())
     }
+}
+
+private struct PlayerHUD: Equatable {
+    let icon: String
+    let value: Double
+}
+
+/// Volumen del sistema: Apple no deja cambiarlo directamente; se hace con el control de volumen
+/// del sistema (MPVolumeView) puesto invisible en el reproductor. Mientras está en pantalla,
+/// iOS tampoco enseña su aviso de volumen (enseñamos el nuestro).
+enum SystemVolume {
+    static weak var view: MPVolumeView?
+
+    static func set(_ value: Float) {
+        guard let slider = view?.subviews.compactMap({ $0 as? UISlider }).first else { return }
+        slider.setValue(max(0, min(1, value)), animated: false)
+        slider.sendActions(for: .valueChanged)
+    }
+}
+
+struct SystemVolumeHost: UIViewRepresentable {
+    func makeUIView(context: Context) -> MPVolumeView {
+        let v = MPVolumeView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        v.isUserInteractionEnabled = false
+        SystemVolume.view = v
+        return v
+    }
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
 }

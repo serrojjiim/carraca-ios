@@ -592,6 +592,9 @@ struct MoviesView: View {
     @State private var seasonal: [VodStream] = []
     /// Portada destacada (carrusel): estrenos recientes con buena nota.
     @State private var featured: [VodStream] = []
+    /// "Seguir viendo" con un toque: lo que se reproduce y la ficha pedida desde el menú.
+    @State private var playing: PlayItem?
+    @State private var detail: VodStream?
     @ObservedObject private var theme = ThemeStore.shared
     @State private var reloading = false
     @State private var loading = false
@@ -688,7 +691,12 @@ struct MoviesView: View {
                 }
                 if !cont.isEmpty {
                     PosterRail("Seguir viendo", items: cont, width: w, title: { $0.title }, image: { $0.icon },
-                               progress: { m in session.resumeFor(movie: m.name).map { Double($0.pro) / 100 } })
+                               progress: { m in session.resumeFor(movie: m.name).map { Double($0.pro) / 100 } },
+                               play: { m in
+                                   guard let r = session.resumeFor(movie: m.name) else { detail = m; return }
+                                   Task { playing = await resumePlayItem(r, movie: m, session: session) }
+                               },
+                               info: { detail = $0 })
                 }
                 let mine = session.watchlist.compactMap { k in k.hasPrefix("m") ? Int(k.dropFirst()).flatMap { byID[$0] } : nil }
                 if !mine.isEmpty {
@@ -719,6 +727,10 @@ struct MoviesView: View {
             .padding(.vertical)
         }
         .refreshable { await load(force: true) }
+        .navigationDestination(isPresented: Binding(get: { detail != nil }, set: { if !$0 { detail = nil } })) {
+            if let m = detail { MovieDetailView(movie: m) }
+        }
+        .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
     }
 
     /// "Especial Navidad", "Noche de miedo"…: pelis cuyo título o categoría encaja con el tema.
@@ -777,6 +789,37 @@ struct MoviesView: View {
             self.error = error.localizedDescription
         }
     }
+}
+
+/// "Seguir viendo" con un toque: qué reproducir para retomar algo empezado. Si se conoce la serie,
+/// con la lista de capítulos (para pasar solo al siguiente); si está descargado, desde el iPhone.
+@MainActor
+func resumePlayItem(_ r: ResumeItem, movie: VodStream? = nil, series: SeriesItem? = nil, session: Session) async -> PlayItem? {
+    let target = ResumeTarget(type: r.type, name: r.name, itemId: r.itemId, season: r.season, episode: r.episode)
+    if r.type == "series", let s = series, let api = session.api, let info = try? await api.seriesInfo(s.id) {
+        let eps = info.episodes[r.season] ?? []
+        if let ep = eps.first(where: { $0.id == r.itemId }) ?? eps.first(where: { $0.number == r.episode }) {
+            var item = SeriesDetailView.episodeItem(series: s, ep: ep, season: r.season, from: r.position, api: api, info: info)
+            if let d = Downloads.shared.item("e\(ep.id)"), d.state == .done {
+                let next = item.next
+                item = PlayItem(url: Downloads.shared.fileURL(d), title: item.title, subtitle: item.subtitle,
+                                startMs: r.position, resume: item.resume)
+                item.next = next
+            }
+            return item
+        }
+    }
+    if r.type == "movie", let m = movie, let api = session.api {
+        let t = ResumeTarget(type: "movie", name: m.name, itemId: String(m.id))
+        if let d = Downloads.shared.item("m\(m.id)"), d.state == .done {
+            return PlayItem(url: Downloads.shared.fileURL(d), title: m.title, startMs: r.position, resume: t)
+        }
+        return PlayItem(url: api.movieURL(m), title: m.title, startMs: r.position, resume: t)
+    }
+    guard let url = session.playableURL(r.url) else { return nil }
+    return PlayItem(url: url, title: r.name.seriesBaseName.cleanTitle,
+                    subtitle: r.type == "series" ? "T\(r.season) · E\(r.episode)" : nil,
+                    startMs: r.position, resume: target)
 }
 
 /// "2024 · ★ 7.1" bajo el título de la portada destacada.
@@ -1027,6 +1070,8 @@ struct SeriesView: View {
     @State private var catNames: [String: String] = [:]
     @State private var seasonal: [SeriesItem] = []
     @ObservedObject private var theme = ThemeStore.shared
+    @State private var playing: PlayItem?
+    @State private var detail: SeriesItem?
     @State private var reloading = false
     @State private var loading = false
     @State private var error: String?
@@ -1121,7 +1166,12 @@ struct SeriesView: View {
                 }
                 if !cont.isEmpty {
                     PosterRail("Seguir viendo", items: cont, width: w, title: { $0.title }, image: { $0.cover },
-                               progress: { s in session.resumeFor(series: s.name).map { Double($0.pro) / 100 } })
+                               progress: { s in session.resumeFor(series: s.name).map { Double($0.pro) / 100 } },
+                               play: { s in
+                                   guard let r = session.resumeFor(series: s.name) else { detail = s; return }
+                                   Task { playing = await resumePlayItem(r, series: s, session: session) }
+                               },
+                               info: { detail = $0 })
                 }
                 let mine = session.watchlist.compactMap { k in k.hasPrefix("s") ? Int(k.dropFirst()).flatMap { byID[$0] } : nil }
                 if !mine.isEmpty {
@@ -1144,6 +1194,10 @@ struct SeriesView: View {
             .padding(.vertical)
         }
         .refreshable { await load(force: true) }
+        .navigationDestination(isPresented: Binding(get: { detail != nil }, set: { if !$0 { detail = nil } })) {
+            if let s = detail { SeriesDetailView(series: s) }
+        }
+        .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
     }
 
     /// Series cuyo título, género o categoría encaja con el tema de temporada.
@@ -1735,7 +1789,11 @@ struct ContinueView: View {
     @State private var allSeries: [SeriesItem] = []
     /// Carátula de cada peli por nombre (de la lista de pelis, que está en caché).
     @State private var movieIcons: [String: String] = [:]
+    @State private var movies: [String: VodStream] = [:]
     @State private var playing: PlayItem?
+    @State private var detail: SeriesItem?
+    /// Preparando la reproducción (fichas de series: hace falta la lista de capítulos).
+    @State private var opening: String?
 
     var body: some View {
         NavigationStack {
@@ -1772,34 +1830,61 @@ struct ContinueView: View {
             }
             .navigationTitle(section == 1 ? "Descargas" : "Seguir viendo")
             .navigationDestination(for: SeriesItem.self) { SeriesDetailView(series: $0) }
+            .navigationDestination(isPresented: Binding(get: { detail != nil }, set: { if !$0 { detail = nil } })) {
+                if let s = detail { SeriesDetailView(series: s) }
+            }
             .withSettings()
         }
         .task {
             await session.refreshResume()
             if allSeries.isEmpty { allSeries = (try? await session.api?.series()) ?? [] }
-            if movieIcons.isEmpty, let movies = try? await session.api?.vodStreams() {
+            if movieIcons.isEmpty, let list = try? await session.api?.vodStreams() {
                 var d: [String: String] = [:]
-                for m in movies { if let i = m.icon, d[m.name] == nil { d[m.name] = i } }
+                var byName: [String: VodStream] = [:]
+                for m in list {
+                    if let i = m.icon, d[m.name] == nil { d[m.name] = i }
+                    if byName[m.name] == nil { byName[m.name] = m }
+                }
                 movieIcons = d
+                movies = byName
             }
         }
         .fullScreenCover(item: $playing, onDismiss: { Task { await session.refreshResume() } }) { PlayerView(item: $0) }
     }
 
+    /// Un toque: sigue donde se dejó (capítulo incluido). La ficha de la serie, con el botón (i).
     @ViewBuilder
     private func row(_ item: ResumeItem) -> some View {
         let series = item.type == "series" ? findSeries(item.name) : nil
         let image = series?.cover ?? (item.type == "movie" ? movieIcons[item.name] : nil)
-        if let s = series {
-            NavigationLink(value: s) { ResumeRow(item: item, image: image) }
-        } else if !item.url.isEmpty, let url = session.playableURL(item.url) {
+        HStack(spacing: 4) {
             Button {
-                playing = PlayItem(url: url, title: item.name.cleanTitle, startMs: item.position,
-                                   resume: ResumeTarget(type: item.type, name: item.name, itemId: item.itemId,
-                                                        season: item.season, episode: item.episode))
-            } label: { ResumeRow(item: item, image: image) }
-        } else {
-            ResumeRow(item: item, image: image)
+                guard opening == nil else { return }
+                opening = item.id
+                Task {
+                    playing = await resumePlayItem(item, movie: movies[item.name], series: series, session: session)
+                    opening = nil
+                }
+            } label: {
+                ResumeRow(item: item, image: image)
+                    .overlay(alignment: .trailing) {
+                        if opening == item.id { ProgressView().padding(.trailing, 6) }
+                    }
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.primary)
+            if let s = series {
+                Button { detail = s } label: {
+                    Image(systemName: "info.circle").font(.title3).foregroundStyle(Color.accentColor).padding(8)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Ver ficha de la serie")
+            }
+        }
+        .contextMenu {
+            if let s = series {
+                Button { detail = s } label: { Label("Ver ficha", systemImage: "info.circle") }
+            }
         }
     }
 

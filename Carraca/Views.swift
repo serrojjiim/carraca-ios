@@ -592,12 +592,24 @@ struct PosterCell: View {
     let image: String?
     var progress: Double? = nil
     var watched = false
+    /// Botón ▶ encima: tocar reproduce (no abre la ficha).
+    var playBadge = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Color.clear
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .overlay { RemoteImage(url: image, title: title) }
+                .overlay {
+                    if playBadge {
+                        Image(systemName: "play.fill")
+                            .font(.body.weight(.bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 38, height: 38)
+                            .background(.black.opacity(0.45), in: Circle())
+                            .overlay(Circle().stroke(.white.opacity(0.7), lineWidth: 1.5))
+                    }
+                }
                 .overlay(alignment: .bottom) {
                     if let progress {
                         ProgressView(value: progress).tint(.accentColor).padding(6)
@@ -797,12 +809,18 @@ struct PosterRail<T: Identifiable & Hashable>: View {
     let imageOf: (T) -> String?
     let progressOf: (T) -> Double?
     let watchedOf: (T) -> Bool
+    /// "Seguir viendo": un toque reproduce directamente; mantener pulsado, "Ver ficha".
+    let playOf: ((T) -> Void)?
+    let infoOf: ((T) -> Void)?
 
     init(_ title: String, tag: String? = nil, seeAll: Category? = nil, count: Int = 0, items: [T], width: CGFloat,
          title titleOf: @escaping (T) -> String, image imageOf: @escaping (T) -> String?,
          progress progressOf: @escaping (T) -> Double? = { _ in nil },
-         watched watchedOf: @escaping (T) -> Bool = { _ in false }) {
+         watched watchedOf: @escaping (T) -> Bool = { _ in false },
+         play playOf: ((T) -> Void)? = nil, info infoOf: ((T) -> Void)? = nil) {
         self.watchedOf = watchedOf
+        self.playOf = playOf
+        self.infoOf = infoOf
         self.title = title
         self.tag = tag
         self.seeAll = seeAll
@@ -835,11 +853,26 @@ struct PosterRail<T: Identifiable & Hashable>: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 12) {
                     ForEach(items) { it in
-                        NavigationLink(value: it) {
-                            PosterCell(title: titleOf(it), image: imageOf(it), progress: progressOf(it), watched: watchedOf(it))
-                                .frame(width: width)
+                        if let playOf {
+                            Button { playOf(it) } label: {
+                                PosterCell(title: titleOf(it), image: imageOf(it), progress: progressOf(it),
+                                           watched: watchedOf(it), playBadge: true)
+                                    .frame(width: width)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button { playOf(it) } label: { Label("Continuar", systemImage: "play.fill") }
+                                if let infoOf {
+                                    Button { infoOf(it) } label: { Label("Ver ficha", systemImage: "info.circle") }
+                                }
+                            }
+                        } else {
+                            NavigationLink(value: it) {
+                                PosterCell(title: titleOf(it), image: imageOf(it), progress: progressOf(it), watched: watchedOf(it))
+                                    .frame(width: width)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal)
