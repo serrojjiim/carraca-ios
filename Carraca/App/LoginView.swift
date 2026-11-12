@@ -21,9 +21,7 @@ struct LoginView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 22) {
-                Image("Logo")
-                    .resizable()
-                    .scaledToFit()
+                ThemedLogo()
                     .frame(height: 120)
                     .padding(.top, 56)
                 Text("Carraca" + (theme.current.map { " " + $0.emoji } ?? "")).font(.largeTitle.bold())

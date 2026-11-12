@@ -100,3 +100,22 @@ struct SeasonDecor: View {
         }
     }
 }
+
+/// Logo de Carraca Player adaptado al tema activo (gorro de Navidad, hojas de otoño…).
+/// Sin tema o con un tema propio: el logo base.
+struct ThemedLogo: View {
+    @ObservedObject private var theme = ThemeStore.shared
+
+    private var name: String {
+        switch theme.current?.id {
+        case "navidad", "halloween", "carnaval", "primavera", "verano", "otono", "invierno":
+            return "Logo-" + (theme.current?.id ?? "base")
+        default:
+            return "Logo-base"
+        }
+    }
+
+    var body: some View {
+        Image(name).resizable().scaledToFit()
+    }
+}

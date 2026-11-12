@@ -17,9 +17,7 @@ struct PaywallView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
-                Image("Logo")
-                    .resizable()
-                    .scaledToFit()
+                ThemedLogo()
                     .frame(height: 90)
                     .padding(.top, 40)
                 Text("Carraca Premium").font(.largeTitle.bold())
