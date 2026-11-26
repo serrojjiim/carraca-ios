@@ -24,6 +24,8 @@ final class PlayerPresence: ObservableObject {
 final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let player = VLCMediaPlayer()
     let clock = PlaybackClock()
+    /// Vista de este reproductor en el teléfono (la pantalla externa la gestiona ExternalDisplay).
+    weak var phoneVideoView: UIView?
 
     @Published var playing = false
     @Published var buffering = true
@@ -182,6 +184,13 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     deinit { watchdog?.invalidate() }
+
+    /// Pone el vídeo en esta vista (la del teléfono o la de la pantalla externa). Con nil no cambia nada.
+    /// VLC admite cambiar la vista mientras reproduce; la reproducción no se reinicia.
+    func showVideo(in view: UIView?) {
+        guard let view else { return }
+        player.drawable = view
+    }
 
     /// Para la reproducción pero deja el controlador listo para otro start() (vista previa).
     func halt() {
@@ -385,6 +394,7 @@ struct VLCVideoView: UIViewRepresentable {
         // Las vistas de VLC no deben quedarse con los toques: si no, los controles
         // de SwiftUI nunca reciben el "tap" y no se puede salir del reproductor.
         v.isUserInteractionEnabled = false
+        controller.phoneVideoView = v
         controller.player.drawable = v
         return v
     }

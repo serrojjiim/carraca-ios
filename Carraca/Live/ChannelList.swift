@@ -11,6 +11,7 @@ struct ChannelListView: View {
     @EnvironmentObject private var session: Session
     @Environment(\.scenePhase) private var phase
     @StateObject private var preview = VLCController()
+    @ObservedObject private var external = ExternalDisplay.shared
     @State private var query = ""
     @State private var selected: LiveStream?
     @State private var pending: Task<Void, Never>?
@@ -79,7 +80,11 @@ struct ChannelListView: View {
                 ZStack {
                     Color.black
                     VLCVideoView(controller: preview)
-                    if preview.failed {
+                    if external.active {
+                        Text("Vista previa desactivada con pantalla externa")
+                            .font(.caption).foregroundStyle(.white.opacity(0.8))
+                            .multilineTextAlignment(.center).padding()
+                    } else if preview.failed {
                         Text("No disponible ahora mismo").font(.caption).foregroundStyle(.white.opacity(0.8))
                     } else if preview.buffering || !preview.playing {
                         ProgressView().tint(.white)
@@ -162,7 +167,9 @@ struct ChannelListView: View {
         epg = []
         pending = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            guard !Task.isCancelled, selected == s, playing == nil, let item = makeItem(s, [s]) else { return }
+            // con pantalla externa no hay vista previa: una sola conexión, la del reproductor
+            guard !Task.isCancelled, selected == s, playing == nil, !external.active,
+                  let item = makeItem(s, [s]) else { return }
             preview.start(url: item.url, startMs: 0, live: true, muted: true)
             // con guía del panel no hace falta preguntar al proveedor (una petición menos por canal)
             if session.guideEnabled {

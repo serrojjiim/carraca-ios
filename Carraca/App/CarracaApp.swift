@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         Task { @MainActor in _ = Downloads.shared.items }   // retoma descargas pendientes
+        Task { @MainActor in ExternalDisplay.shared.start() }   // pantalla externa (AirPlay/HDMI)
         UNUserNotificationCenter.current().delegate = self
         return true
     }

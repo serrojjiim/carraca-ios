@@ -9,6 +9,8 @@ struct PlayerView: View {
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
     @StateObject private var vlc = VLCController()
+    /// Pantalla externa (AirPlay/HDMI): si está activa, el vídeo sale ahí y aquí solo van los controles.
+    @ObservedObject private var external = ExternalDisplay.shared
     @State private var showControls = true
     @State private var hideWork: DispatchWorkItem?
     @State private var epg: [EPGEntry] = []
@@ -66,6 +68,10 @@ struct PlayerView: View {
                 .ignoresSafeArea()
                 .scaleEffect(1 - min(closeOffset, 400) / 1600)
                 .offset(y: closeOffset)
+            if external.active {
+                ExternalPlaybackNotice(routeName: external.routeName)
+                    .allowsHitTesting(false)
+            }
             // Capa que recibe los toques encima del vídeo (muestra/oculta los controles).
             // Pelis y series: doble toque a la izquierda / derecha = atrasar / adelantar 10 s.
             GeometryReader { geo in
@@ -110,14 +116,14 @@ struct PlayerView: View {
                 .transition(.opacity)
                 .zIndex(3)
             }
-            if vlc.buffering && !vlc.failed && upNext == nil {
+            if vlc.buffering && !vlc.failed && upNext == nil && !external.active {
                 ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false)
             }
             if let next = upNext {
                 upNextCard(next)
             } else if vlc.failed {
                 failure
-            } else if showControls && !showChannels && !locked && dragMode != .close {
+            } else if (showControls || external.active) && !showChannels && !locked && dragMode != .close {
                 controls.transition(.opacity)
             }
             if showChannels {
@@ -144,6 +150,8 @@ struct PlayerView: View {
             if item.isLive, !item.channels.isEmpty { channelIndex = item.channelIndex }
             // la cuenta solo admite una conexión: si se está descargando algo, se pausa mientras tanto
             if !item.url.isFileURL { Downloads.shared.pauseForPlayback() }
+            // antes de arrancar: si ya hay pantalla externa (espejo activo), el vídeo sale ahí
+            ExternalDisplay.shared.bind(vlc)
             vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
             rememberChannel()
             setUpRemoteCommands()
@@ -156,6 +164,7 @@ struct PlayerView: View {
             if item.isLive { session.objectWillChange.send() }
             // Ajustes > Descargas > Borrar lo ya visto
             Downloads.shared.removeWatched(session.isWatched(download:))
+            ExternalDisplay.shared.unbind(vlc)
             vlc.stop()
             tearDownRemoteCommands()
             Downloads.shared.resumeAfterPlayback()
@@ -250,6 +259,8 @@ struct PlayerView: View {
                         }
                         .accessibilityLabel("Lista de canales")
                     }
+                    AirPlayButton()
+                        .frame(width: 44, height: 44)
                     optionsMenu
                     if !vlc.audioTracks.isEmpty || !vlc.subtitleTracks.isEmpty { tracksMenu }
                 }
