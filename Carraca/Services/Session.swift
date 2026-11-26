@@ -420,6 +420,7 @@ final class Session: ObservableObject {
 
     func logout() {
         syncDebounce?.cancel()
+        ProgramReminders.shared.clearAll()
         Keychain.delete()
         DiskCache.clear()
         LocalResume.clear()

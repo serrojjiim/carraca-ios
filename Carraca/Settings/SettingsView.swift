@@ -13,7 +13,9 @@ struct SettingsView: View {
     @AppStorage(DownloadPrefs.wifiOnlyKey) private var wifiOnly = true
     @AppStorage(DownloadPrefs.autoDeleteKey) private var autoDelete = false
     @AppStorage(ThemeStore.decorKey) private var decor = true
+    @AppStorage(ProgramReminders.leadKey) private var remindLead = 5
     @ObservedObject private var theme = ThemeStore.shared
+    @ObservedObject private var alerts = ProgramReminders.shared
 
     var body: some View {
         NavigationStack {
@@ -69,6 +71,39 @@ struct SettingsView: View {
                     Text("Reproducción")
                 } footer: {
                     Text("Si el vídeo trae ese idioma o subtítulo, se pone solo al empezar.")
+                }
+                Section {
+                    Picker("Avisar antes", selection: $remindLead) {
+                        ForEach(ProgramReminders.leadOptions, id: \.self) { m in
+                            Text("\(m) min").tag(m)
+                        }
+                    }
+                    .onChange(of: remindLead) { _ in
+                        Task { await alerts.reschedule() }
+                    }
+                    if alerts.reminders.isEmpty {
+                        Text("No tienes avisos programados.").foregroundStyle(.secondary)
+                    } else {
+                        ForEach(alerts.reminders) { r in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(r.title).lineLimit(1)
+                                Text("\(r.channelName) · \(r.start.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .swipeActions {
+                                Button(role: .destructive) {
+                                    alerts.remove(channelKey: r.channelKey, start: r.start)
+                                } label: {
+                                    Label("Quitar", systemImage: "bell.slash")
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Avisos de programas")
+                } footer: {
+                    Text("Desde la guía (Directo) puedes avisarte antes de que empiece un programa; al tocar el aviso se abre el canal. iOS admite hasta 64 avisos a la vez en total.")
                 }
                 Section {
                     Toggle("Descargar solo con Wi-Fi", isOn: $wifiOnly)

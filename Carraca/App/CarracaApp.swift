@@ -37,6 +37,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     /// Pestaña que abrir al tocar un aviso (si la app aún no tenía las pestañas en pantalla).
     static var pendingTab: String?
     static let openTab = Notification.Name("carraca.openTab")
+    /// Canal que abrir al tocar un aviso de programa (clave del canal = Session.favoriteID).
+    static var pendingChannelKey: String?
+    static let openChannel = Notification.Name("carraca.openChannel")
 
     func application(_ application: UIApplication,
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
@@ -68,10 +71,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     /// Tocar el aviso: a la pestaña de Eventos.
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        if let tab = response.notification.request.content.userInfo["tab"] as? String {
+        let info = response.notification.request.content.userInfo
+        if let tab = info["tab"] as? String {
             DispatchQueue.main.async {
                 Self.pendingTab = tab
                 NotificationCenter.default.post(name: Self.openTab, object: tab)
+            }
+        }
+        // Aviso de programa: a Directo y a reproducir el canal (LiveView lo abre cuando tiene la lista)
+        if let key = info["channel"] as? String {
+            DispatchQueue.main.async {
+                Self.pendingChannelKey = key
+                Self.pendingTab = "live"
+                NotificationCenter.default.post(name: Self.openTab, object: "live")
+                NotificationCenter.default.post(name: Self.openChannel, object: key)
             }
         }
         completionHandler()
