@@ -24,6 +24,8 @@ struct LiveView: View {
     @Environment(\.horizontalSizeClass) private var hsize
     /// iPad: categoría elegida en la columna de la izquierda.
     @State private var selected: Category?
+    /// Guía en rejilla por horas (pantalla completa).
+    @State private var showGuide = false
 
     var body: some View {
         Group {
@@ -32,6 +34,15 @@ struct LiveView: View {
         .task {
             if streams.isEmpty { await load() }
             await session.refreshGuide()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AppDelegate.openChannel)) { _ in
+            openPendingChannel()
+        }
+        .fullScreenCover(isPresented: $showGuide) {
+            GuideGridView(categories: guideCategories, initial: .all,
+                          title: { title(of: $0) },
+                          channels: { channels(in: $0) },
+                          makeItem: { s, l in makeItem(s, l) })
         }
         .onChange(of: session.reloadToken) { _ in
             Task {
@@ -74,6 +85,14 @@ struct LiveView: View {
                     VStack(spacing: 12) {
                         Image(systemName: "sidebar.left").font(.largeTitle).foregroundStyle(.secondary)
                         Text("Elige una categoría").foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    if session.guideEnabled {
+                        Button { showGuide = true } label: { Image(systemName: "calendar") }
+                            .accessibilityLabel("Guía de programación")
                     }
                 }
             }
@@ -197,6 +216,12 @@ struct LiveView: View {
                     }
                     .accessibilityLabel(asList ? "Ver en tarjetas" : "Ver en lista")
                 }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if session.guideEnabled {
+                        Button { showGuide = true } label: { Image(systemName: "calendar") }
+                            .accessibilityLabel("Guía de programación")
+                    }
+                }
             }
             .searchable(text: $query, prompt: "Buscar canal")
             .navigationDestination(for: Category.self) { cat in
@@ -315,9 +340,25 @@ struct LiveView: View {
             streams = all
             index = await makeSearchIndex(all) { $0.name }
             error = nil
+            openPendingChannel()
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    /// Categorías de la guía: todos, favoritos (si hay) y las demás.
+    private var guideCategories: [Category] {
+        var list = [Category.all]
+        if !channels(in: Category.favorites).isEmpty { list.append(Category.favorites) }
+        return list + categories
+    }
+
+    /// Aviso de programa tocado: reproduce ese canal (si la lista ya está cargada; si no, al cargarla).
+    private func openPendingChannel() {
+        guard let key = AppDelegate.pendingChannelKey, !streams.isEmpty else { return }
+        AppDelegate.pendingChannelKey = nil
+        guard let s = streams.first(where: { Session.favoriteID($0) == key }) else { return }
+        play(s, in: byCategory[s.categoryId] ?? [s])
     }
 
     /// Qué reproducir para un canal, con la lista para cambiar a anterior / siguiente.
