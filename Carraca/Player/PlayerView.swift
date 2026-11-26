@@ -11,6 +11,12 @@ struct PlayerView: View {
     @StateObject private var vlc = VLCController()
     /// Pantalla externa (AirPlay/HDMI): si está activa, el vídeo sale ahí y aquí solo van los controles.
     @ObservedObject private var external = ExternalDisplay.shared
+    /// AirPlay con relay: la TV muestra el vídeo y el teléfono no reproduce nada (ver AirPlayRelay.swift).
+    @ObservedObject private var cast = AirPlayCast.shared
+    /// Último estado de la salida AirPlay (solo se actúa cuando cambia de verdad).
+    @State private var routeAirPlay = AirPlayCast.routeIsAirPlay
+    /// false al salir del reproductor: no se vuelve a abrir la conexión después.
+    @State private var alive = true
     @State private var showControls = true
     @State private var hideWork: DispatchWorkItem?
     @State private var epg: [EPGEntry] = []
@@ -68,8 +74,12 @@ struct PlayerView: View {
                 .ignoresSafeArea()
                 .scaleEffect(1 - min(closeOffset, 400) / 1600)
                 .offset(y: closeOffset)
-            if external.active {
-                ExternalPlaybackNotice(routeName: external.routeName)
+            // AVPlayer de la emisión AirPlay: capa oculta (el vídeo sale por la TV)
+            CastPlayerHost(player: cast.player)
+                .frame(width: 1, height: 1)
+                .allowsHitTesting(false)
+            if external.active || cast.phase == .casting {
+                ExternalPlaybackNotice(routeName: external.active ? external.routeName : AirPlayCast.routeName)
                     .allowsHitTesting(false)
             }
             // Capa que recibe los toques encima del vídeo (muestra/oculta los controles).
@@ -116,10 +126,12 @@ struct PlayerView: View {
                 .transition(.opacity)
                 .zIndex(3)
             }
-            if vlc.buffering && !vlc.failed && upNext == nil && !external.active {
+            if vlc.buffering && !vlc.failed && upNext == nil && !external.active && cast.phase == .idle {
                 ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false)
             }
-            if let next = upNext {
+            if cast.phase != .idle {
+                castOverlay
+            } else if let next = upNext {
                 upNextCard(next)
             } else if vlc.failed {
                 failure
@@ -152,13 +164,19 @@ struct PlayerView: View {
             if !item.url.isFileURL { Downloads.shared.pauseForPlayback() }
             // antes de arrancar: si ya hay pantalla externa (espejo activo), el vídeo sale ahí
             ExternalDisplay.shared.bind(vlc)
-            vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
+            // si la salida ya es AirPlay, no se abre VLC: directamente la emisión por el relay
+            if castPossible, AirPlayCast.routeIsAirPlay {
+                startCast(fromMs: item.isLive ? 0 : item.startMs)
+            } else {
+                vlc.start(url: item.url, startMs: item.startMs, live: item.isLive)
+            }
             rememberChannel()
             setUpRemoteCommands()
             scheduleHide()
         }
         .onDisappear {
             report()
+            alive = false
             if let b = originalBrightness { UIScreen.main.brightness = b }
             // el último canal se guardó sin avisar; ahora sí, para "Seguir viendo · canal"
             if item.isLive { session.objectWillChange.send() }
@@ -167,7 +185,11 @@ struct PlayerView: View {
             ExternalDisplay.shared.unbind(vlc)
             vlc.stop()
             tearDownRemoteCommands()
-            Downloads.shared.resumeAfterPlayback()
+            // las descargas solo vuelven a abrir conexión cuando la emisión AirPlay ya la ha soltado
+            Task { @MainActor in
+                await AirPlayCast.shared.stop()
+                Downloads.shared.resumeAfterPlayback()
+            }
             ThemeStore.shared.paused = false
             PlayerPresence.shared.open = false
             UIApplication.shared.isIdleTimerDisabled = false
@@ -178,6 +200,14 @@ struct PlayerView: View {
             updateNowPlaying()
         }
         .onReceive(second) { _ in secondTick() }
+        // salida de audio: iPhone <-> AirPlay (solo en cambios reales de la salida)
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { _ in
+            routeChanged()
+        }
+        // con pantalla externa (espejo) manda el espejo: la emisión por relay se para
+        .onChange(of: external.active) { on in
+            if on, cast.phase != .idle { leaveCast() }
+        }
         .onChange(of: vlc.ended) { done in
             guard done else { return }
             report(final: true)
@@ -270,18 +300,18 @@ struct PlayerView: View {
 
                 HStack(spacing: 52) {
                     if !item.isLive {
-                        Button { vlc.jump(-10); scheduleHide() } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+                        Button { jumpBy(-10); scheduleHide() } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
                             .accessibilityLabel("Atrasar 10 segundos")
                     } else if canZap {
                         Button { zap(-1) } label: { Image(systemName: "backward.end.fill").font(.system(size: 32)) }
                             .accessibilityLabel("Canal anterior")
                     }
-                    Button { vlc.toggle(); scheduleHide() } label: {
+                    Button { togglePlayback(); scheduleHide() } label: {
                         Image(systemName: vlc.playing ? "pause.fill" : "play.fill").font(.system(size: 46))
                     }
                     .accessibilityLabel(vlc.playing ? "Pausa" : "Reproducir")
                     if !item.isLive {
-                        Button { vlc.jump(30); scheduleHide() } label: { Image(systemName: "goforward.30").font(.system(size: 34)) }
+                        Button { jumpBy(30); scheduleHide() } label: { Image(systemName: "goforward.30").font(.system(size: 34)) }
                             .accessibilityLabel("Adelantar 30 segundos")
                     } else if canZap {
                         Button { zap(1) } label: { Image(systemName: "forward.end.fill").font(.system(size: 32)) }
@@ -500,15 +530,15 @@ struct PlayerView: View {
     /// ↑ ↓ = 1 min (en directo, canal), Esc = cerrar.
     private var keyboardShortcuts: some View {
         ZStack {
-            Button("Pausa") { vlc.toggle(); showControlsBriefly() }
+            Button("Pausa") { togglePlayback(); showControlsBriefly() }
                 .keyboardShortcut(.space, modifiers: [])
             Button("Atrás") { item.isLive ? zap(-1) : doubleTapSeek(forward: false) }
                 .keyboardShortcut(.leftArrow, modifiers: [])
             Button("Adelante") { item.isLive ? zap(1) : doubleTapSeek(forward: true) }
                 .keyboardShortcut(.rightArrow, modifiers: [])
-            Button("Subir") { if item.isLive { zap(-1) } else { vlc.jump(60); showControlsBriefly() } }
+            Button("Subir") { if item.isLive { zap(-1) } else { jumpBy(60); showControlsBriefly() } }
                 .keyboardShortcut(.upArrow, modifiers: [])
-            Button("Bajar") { if item.isLive { zap(1) } else { vlc.jump(-60); showControlsBriefly() } }
+            Button("Bajar") { if item.isLive { zap(1) } else { jumpBy(-60); showControlsBriefly() } }
                 .keyboardShortcut(.downArrow, modifiers: [])
             Button("Cerrar") { dismiss() }
                 .keyboardShortcut(.escape, modifiers: [])
@@ -632,7 +662,7 @@ struct PlayerView: View {
         let step = forward ? 10 : -10
         if (seekFlash > 0) != forward { seekFlash = 0 }
         withAnimation(.easeOut(duration: 0.12)) { seekFlash += step }
-        vlc.jump(Int32(step))
+        jumpBy(step)
         flashWork?.cancel()
         let w = DispatchWorkItem { withAnimation(.easeIn(duration: 0.25)) { seekFlash = 0 } }
         flashWork = w
@@ -649,7 +679,9 @@ struct PlayerView: View {
     private func report(final: Bool = false) {
         guard !item.isLive else { return }
         let len = vlc.lengthMs
-        session.report(item, timeMs: final ? len : vlc.timeMs, lengthMs: len)
+        // con AirPlay, la posición es la de la emisión (VLC está parado)
+        let t = cast.phase == .idle ? vlc.timeMs : Int(cast.positionSec * 1000)
+        session.report(item, timeMs: final ? len : t, lengthMs: len)
     }
 
     private func secondTick() {
@@ -665,6 +697,8 @@ struct PlayerView: View {
 
     /// Pasa al siguiente capítulo sin salir del reproductor.
     private func playNextNow() {
+        // con AirPlay no se cambia de capítulo desde aquí (la emisión va por el relay)
+        guard cast.phase == .idle else { return }
         let next = upNext ?? item.next?()
         upNext = nil
         guard let next else { dismiss(); return }
@@ -740,7 +774,11 @@ struct PlayerView: View {
         zapWork?.cancel()
         let channel = item.channels[next]
         let work = DispatchWorkItem {
-            vlc.start(url: urlFor(channel), startMs: 0, live: true)
+            if cast.phase != .idle {
+                if let src = castSource(for: channel) { cast.zap(to: src) }
+            } else {
+                vlc.start(url: urlFor(channel), startMs: 0, live: true)
+            }
             rememberChannel()
             updateNowPlaying()
             Task { await loadEPG() }
@@ -774,21 +812,191 @@ struct PlayerView: View {
         epg = (try? await api.shortEPG(id)) ?? []
     }
 
+    // MARK: AirPlay con relay (la TV muestra el vídeo; el teléfono no reproduce)
+
+    /// Lo que se emite ahora: en directo, el canal actual; en VOD, la peli o capítulo.
+    private var currentCast: CastSource? {
+        if item.isLive, let c = currentChannel { return castSource(for: c) }
+        return item.cast
+    }
+
+    /// Canal de directo emitible (solo Xtream: los M3U tienen URL directa).
+    private func castSource(for c: LiveStream) -> CastSource? {
+        c.directURL == nil ? CastSource(kind: .live, id: c.id, ext: nil) : nil
+    }
+
+    /// Se puede emitir: cuenta del servidor Carraca, hay fuente y no hay pantalla con espejo.
+    private var castPossible: Bool {
+        session.isCarracaServer && session.creds != nil && currentCast != nil && !external.active
+    }
+
+    /// La URL que VLC usaría para lo que se ve ahora (al volver al iPhone).
+    private var vlcURL: URL {
+        if item.isLive, let c = currentChannel, let f = item.channelURL { return f(c) }
+        return item.url
+    }
+
+    private func startCast(fromMs: Int) {
+        guard castPossible, let src = currentCast, let c = session.creds else { return }
+        // VLC se para antes: el servidor necesita su conexión libre (la espera la hace AirPlayCast)
+        vlc.suspend()
+        cast.begin(src, user: c.user, pass: c.pass, fromSec: Double(max(0, fromMs)) / 1000, wait: 2)
+    }
+
+    /// Cambio de salida de audio: iPhone -> AirPlay arranca la emisión; AirPlay -> iPhone vuelve a VLC.
+    /// Un fallo deja el aviso y no vuelve a intentar solo: solo cambia con el siguiente cambio de salida.
+    private func routeChanged() {
+        let nowAirPlay = AirPlayCast.routeIsAirPlay
+        guard nowAirPlay != routeAirPlay else { return }
+        routeAirPlay = nowAirPlay
+        guard alive else { return }
+        if nowAirPlay {
+            guard cast.phase == .idle, castPossible else { return }
+            startCast(fromMs: item.isLive ? 0 : (vlc.timeMs > 0 ? vlc.timeMs : item.startMs))
+        } else if cast.phase != .idle {
+            leaveCast()
+        }
+    }
+
+    /// Para la emisión y vuelve a VLC en el teléfono, desde donde se quedó.
+    private func leaveCast() {
+        let live = item.isLive
+        let ms = Int(cast.positionSec * 1000)
+        let wasPaused = !cast.playing
+        Task { @MainActor in
+            await AirPlayCast.shared.stop()
+            // dar tiempo a que el proveedor suelte la conexión antes de abrir VLC
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard alive else { return }
+            vlc.resume()
+            vlc.start(url: vlcURL, startMs: live ? 0 : ms, live: live)
+            if wasPaused { vlc.pause() }
+        }
+    }
+
+    private func togglePlayback() {
+        if cast.phase == .casting { cast.togglePlay() } else { vlc.toggle() }
+    }
+
+    private func setPlaying(_ on: Bool) {
+        if cast.phase == .casting { cast.setPlaying(on) } else if on { vlc.play() } else { vlc.pause() }
+    }
+
+    /// Salto relativo: en VOD con AirPlay es un arranque nuevo desde esa posición.
+    private func jumpBy(_ seconds: Int) {
+        if cast.phase == .casting {
+            if !item.isLive { cast.jump(by: Double(seconds)) }
+            return
+        }
+        vlc.jump(Int32(seconds))
+    }
+
+    /// Mientras se emite: controles propios (el teléfono no reproduce nada).
+    private var castOverlay: some View {
+        VStack {
+            HStack(alignment: .top, spacing: 14) {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark")
+                        .font(.title3.weight(.semibold))
+                        .padding(12)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .accessibilityLabel("Cerrar")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.headline).lineLimit(1)
+                    if let s = item.subtitle { Text(s).font(.subheadline).opacity(0.8).lineLimit(1) }
+                }
+                Spacer()
+                AirPlayButton()
+                    .frame(width: 44, height: 44)
+            }
+            .padding()
+
+            Spacer()
+
+            switch cast.phase {
+            case .preparing:
+                VStack(spacing: 12) {
+                    ProgressView().controlSize(.large).tint(.white)
+                    Text("Preparando emisión…").font(.headline)
+                }
+            case .casting:
+                castTransport
+            case .failed(let message):
+                VStack(spacing: 14) {
+                    Image(systemName: "airplayvideo").font(.largeTitle)
+                    Text(message).font(.headline).multilineTextAlignment(.center)
+                    HStack(spacing: 16) {
+                        Button("Reintentar") { cast.retry() }.buttonStyle(.borderedProminent)
+                        Button("Reproducir aquí") { leaveCast() }.buttonStyle(.bordered)
+                    }
+                }
+                .padding(24)
+            case .idle:
+                EmptyView()
+            }
+
+            Spacer()
+        }
+        .foregroundStyle(.white)
+    }
+
+    private var castTransport: some View {
+        VStack(spacing: 22) {
+            HStack(spacing: 52) {
+                if !item.isLive {
+                    Button { jumpBy(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+                        .accessibilityLabel("Atrasar 10 segundos")
+                } else if canZap {
+                    Button { zap(-1) } label: { Image(systemName: "backward.end.fill").font(.system(size: 32)) }
+                        .accessibilityLabel("Canal anterior")
+                }
+                Button { togglePlayback() } label: {
+                    Image(systemName: cast.playing ? "pause.fill" : "play.fill").font(.system(size: 46))
+                }
+                .accessibilityLabel(cast.playing ? "Pausa" : "Reproducir")
+                if !item.isLive {
+                    Button { jumpBy(10) } label: { Image(systemName: "goforward.10").font(.system(size: 34)) }
+                        .accessibilityLabel("Adelantar 10 segundos")
+                } else if canZap {
+                    Button { zap(1) } label: { Image(systemName: "forward.end.fill").font(.system(size: 32)) }
+                        .accessibilityLabel("Canal siguiente")
+                }
+            }
+            Button { leaveCast() } label: {
+                Label("Volver al iPhone", systemImage: "iphone")
+            }
+            .buttonStyle(.bordered)
+            if !cast.videoOnTV {
+                Text("El vídeo aún no llega a la TV. Si no aparece, elige la TV otra vez en el botón de AirPlay.")
+                    .font(.caption)
+                    .multilineTextAlignment(.center)
+                    .opacity(0.8)
+                    .padding(.horizontal, 30)
+            }
+            Text("Para que el sonido salga del iPhone, elígelo en el botón de AirPlay.")
+                .font(.caption)
+                .multilineTextAlignment(.center)
+                .opacity(0.7)
+                .padding(.horizontal, 30)
+        }
+    }
+
     // MARK: Pantalla de bloqueo / Centro de control
 
     private func setUpRemoteCommands() {
         let cc = MPRemoteCommandCenter.shared()
-        cc.playCommand.addTarget { _ in vlc.player.play(); return .success }
-        cc.pauseCommand.addTarget { _ in vlc.player.pause(); return .success }
-        cc.togglePlayPauseCommand.addTarget { _ in vlc.toggle(); return .success }
+        cc.playCommand.addTarget { _ in setPlaying(true); return .success }
+        cc.pauseCommand.addTarget { _ in setPlaying(false); return .success }
+        cc.togglePlayPauseCommand.addTarget { _ in togglePlayback(); return .success }
         if item.isLive {
             cc.nextTrackCommand.addTarget { _ in zap(1); return .success }
             cc.previousTrackCommand.addTarget { _ in zap(-1); return .success }
         } else {
             cc.skipForwardCommand.preferredIntervals = [30]
             cc.skipBackwardCommand.preferredIntervals = [10]
-            cc.skipForwardCommand.addTarget { _ in vlc.jump(30); return .success }
-            cc.skipBackwardCommand.addTarget { _ in vlc.jump(-10); return .success }
+            cc.skipForwardCommand.addTarget { _ in jumpBy(30); return .success }
+            cc.skipBackwardCommand.addTarget { _ in jumpBy(-10); return .success }
         }
         updateNowPlaying()
     }

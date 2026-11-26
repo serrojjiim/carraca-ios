@@ -243,7 +243,10 @@ func resumePlayItem(_ r: ResumeItem, movie: VodStream? = nil, series: SeriesItem
         return Downloads.shared.preferLocal(PlayItem.movie(m, from: r.position, api: api), id: "m\(m.id)")
     }
     guard let url = session.playableURL(r.url) else { return nil }
+    // mismo contenido que la ficha (id numérico + extensión de la URL) para poder emitirlo por AirPlay
+    let ext = url.pathExtension.isEmpty ? nil : url.pathExtension
+    let cast = Int(r.itemId).map { CastSource(kind: r.type == "series" ? .series : .movie, id: $0, ext: ext) }
     return PlayItem(url: url, title: r.name.seriesBaseName.cleanTitle,
                     subtitle: r.type == "series" ? "T\(r.season) · E\(r.episode)" : nil,
-                    startMs: r.position, resume: target)
+                    startMs: r.position, resume: target, cast: cast)
 }

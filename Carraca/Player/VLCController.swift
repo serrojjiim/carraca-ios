@@ -70,6 +70,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var muted = false
     /// true tras halt(): los reintentos pendientes ya no deben arrancar nada.
     private var halted = false
+    /// true mientras la emisión AirPlay (relay) tiene la conexión: ningún método de aquí la reabre.
+    private var suspended = false
     /// Salto en curso: a dónde se ha pedido ir (VLC tarda un momento en confirmar la nueva posición).
     private var seekTarget: Int?
     private var seekStarted = Date.distantPast
@@ -86,6 +88,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func start(url: URL, startMs: Int, live: Bool, muted: Bool = false) {
+        // con AirPlay (relay) el servidor tiene la única conexión: aquí no se abre nada
+        guard !suspended else { return }
         if url != self.url {
             lastStallRestart = .distantPast
             stallRestarts = 0
@@ -142,16 +146,40 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func restart() {
+        guard !suspended else { return }
         retries = 0
         guard let url else { return }
         start(url: url, startMs: live ? 0 : timeMs, live: live)
     }
 
     func toggle() {
+        guard !suspended else { return }
         if player.isPlaying { player.pause() } else { player.play() }
     }
 
+    func play() {
+        guard !suspended else { return }
+        player.play()
+    }
+
+    func pause() {
+        guard !suspended else { return }
+        player.pause()
+    }
+
+    /// AirPlay con relay: VLC se para y se suelta la conexión. Nada vuelve a conectar hasta resume().
+    func suspend() {
+        halt()
+        suspended = true
+    }
+
+    /// Fin de la emisión AirPlay: la siguiente start() vuelve a abrir la conexión.
+    func resume() {
+        suspended = false
+    }
+
     func seek(toFraction f: Double) {
+        guard !suspended else { return }
         let frac = max(0, min(1, f))
         if lengthMs > 0 {
             seek(toMs: Int(Double(lengthMs) * frac))
@@ -167,6 +195,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     /// Salto a un tiempo absoluto. Varios saltos seguidos se encadenan desde el último destino
     /// pedido, y si hay un corte mientras tanto se retoma desde ahí, no desde el sitio viejo.
     private func seek(toMs requested: Int) {
+        guard !suspended else { return }
         let target = max(0, lengthMs > 0 ? min(requested, lengthMs - 2000) : requested)
         guard target != (seekTarget ?? timeMs) else { return }
         seekTarget = target

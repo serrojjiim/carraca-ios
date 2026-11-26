@@ -18,6 +18,9 @@ struct PlayItem: Identifiable {
     var allChannels: [LiveStream] = []
     /// Series: lo que va después (siguiente capítulo automático al acabar).
     var next: (() -> PlayItem?)? = nil
+    /// Si se puede emitir por AirPlay (relay): la cuenta Xtream del servidor Carraca y el id del stream.
+    /// nil para M3U, descargas y archivos locales.
+    var cast: CastSource? = nil
 }
 
 extension PlayItem {
@@ -27,6 +30,7 @@ extension PlayItem {
         let urlFor: (LiveStream) -> URL? = { c in c.directURL ?? api?.liveURL(c.id) }
         guard let url = urlFor(s) else { return nil }
         var item = PlayItem(url: url, title: s.label.name, isLive: true, liveStreamId: s.directURL == nil ? s.id : nil)
+        item.cast = s.directURL == nil ? CastSource(kind: .live, id: s.id, ext: nil) : nil
         let playable = list.filter { urlFor($0) != nil }
         item.channels = playable
         item.channelIndex = playable.firstIndex(of: s) ?? 0
@@ -38,7 +42,8 @@ extension PlayItem {
     /// Película desde `ms`, con lo necesario para "Seguir viendo".
     static func movie(_ m: VodStream, from ms: Int, api: XtreamAPI) -> PlayItem {
         PlayItem(url: api.movieURL(m), title: m.title, startMs: ms,
-                 resume: ResumeTarget(type: "movie", name: m.name, itemId: String(m.id)))
+                 resume: ResumeTarget(type: "movie", name: m.name, itemId: String(m.id)),
+                 cast: CastSource(kind: .movie, id: m.id, ext: m.ext))
     }
 
     /// Capítulo, con el siguiente ya preparado (siguiente capítulo automático).
@@ -47,6 +52,7 @@ extension PlayItem {
         var item = PlayItem(url: api.episodeURL(ep), title: series.title,
                             subtitle: "T\(s) · E\(ep.number) · \(ep.title.cleanTitle)", startMs: ms,
                             resume: ResumeTarget(type: "series", name: series.name, itemId: ep.id, season: s, episode: ep.number))
+        if let num = Int(ep.id) { item.cast = CastSource(kind: .series, id: num, ext: ep.ext) }
         if let info, let n = info.episode(after: ep, season: s) {
             item.next = { PlayItem.episode(series: series, ep: n.1, season: n.0, from: 0, api: api, info: info) }
         }
