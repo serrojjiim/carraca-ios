@@ -66,6 +66,8 @@ final class Session: ObservableObject {
         if let c = Keychain.load() { apply(c) }
         Task {
             await refreshRemote()
+            // Favoritos y Mi lista: después de saber si el servidor es Carraca (config.json)
+            scheduleSync()
             await refreshResume()
             if let api { account = try? await api.authenticate() }
         }
@@ -76,7 +78,90 @@ final class Session: ObservableObject {
         api = c.m3u == nil ? XtreamAPI(base: c.server, user: c.user, pass: c.pass) : nil
         favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
         watchlist = UserDefaults.standard.stringArray(forKey: watchlistKey) ?? []
+        syncBlocked = false
         GuideStore.shared.reset()
+    }
+
+    // MARK: Sincronización de favoritos y Mi lista (solo cuentas del servidor Carraca)
+
+    private var syncRunning = false
+    /// 403 del servidor (la contraseña ya no es la del token): no se reintenta hasta volver a entrar.
+    private var syncBlocked = false
+    private var syncDebounce: Task<Void, Never>?
+
+    var syncEnabled: Bool {
+        guard let c = creds, c.m3u == nil else { return false }
+        return isCarracaServer
+    }
+
+    /// Encola un cambio local y sincroniza unos segundos después (agrupa varios toques seguidos).
+    private func queueSync(_ k: String, _ id: String, on: Bool) {
+        guard syncEnabled, let user = creds?.user else { return }
+        let op = SyncOp(uid: UUID().uuidString, k: k, id: id, on: on, ts: Int(Date().timeIntervalSince1970))
+        SyncQueue.save(SyncQueue.enqueue(op, into: SyncQueue.load(user)), user: user)
+        scheduleSync()
+    }
+
+    /// Sincroniza dentro de 2 s (o al volver a la app / entrar en la cuenta).
+    func scheduleSync() {
+        guard syncEnabled else { return }
+        syncDebounce?.cancel()
+        syncDebounce = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.syncNow()
+        }
+    }
+
+    /// Envía lo pendiente y recibe el estado del servidor. Sin red, lo pendiente se queda en la cola.
+    func syncNow() async {
+        guard syncEnabled, !syncBlocked, !syncRunning, let c = creds else { return }
+        let user = c.user
+        syncRunning = true
+        defer { syncRunning = false }
+
+        let firstTime = !UserDefaults.standard.bool(forKey: SyncQueue.initKey(user))
+        let pending = SyncQueue.load(user)
+        var batch: [SyncOp] = []
+        // Primera vez en este aparato: lo que ya hay aquí se sube con ts=1 (así no pisa borrados
+        // más recientes hechos en otro aparato).
+        if firstTime {
+            batch += favorites.sorted().map { SyncOp(uid: "", k: "fav", id: $0, on: true, ts: 1) }
+            batch += watchlist.map { SyncOp(uid: "", k: "list", id: $0, on: true, ts: 1) }
+        }
+        batch += pending
+
+        let result = await SyncService.send(user: user, pass: c.pass, ops: batch)
+        switch result {
+        case .forbidden:
+            syncBlocked = true
+        case .failed:
+            break
+        case let .ok(fav, list):
+            // Se quitan solo las operaciones que el servidor ya tiene; las cambiadas durante la
+            // petición siguen en la cola y se vuelven a aplicar encima de la respuesta.
+            let sent = Set(pending.map(\.uid))
+            let rest = SyncQueue.load(user).filter { !sent.contains($0.uid) }
+            SyncQueue.save(rest, user: user)
+            UserDefaults.standard.set(true, forKey: SyncQueue.initKey(user))
+
+            var fs = favorites
+            if let fav { fs = Set(fav) }
+            var ls = watchlist
+            if let list { ls = list }
+            for op in rest {
+                if op.k == "fav" {
+                    if op.on { fs.insert(op.id) } else { fs.remove(op.id) }
+                } else {
+                    ls.removeAll { $0 == op.id }
+                    if op.on { ls.insert(op.id, at: 0) }
+                }
+            }
+            favorites = fs
+            watchlist = ls
+            UserDefaults.standard.set(Array(fs), forKey: favoritesKey)
+            UserDefaults.standard.set(ls, forKey: watchlistKey)
+        }
     }
 
     // MARK: Guía "ahora / después" (solo cuentas del servidor Carraca: la genera su panel)
@@ -125,6 +210,7 @@ final class Session: ObservableObject {
     func toggleList(_ key: String) {
         if let i = watchlist.firstIndex(of: key) { watchlist.remove(at: i) } else { watchlist.insert(key, at: 0) }
         UserDefaults.standard.set(watchlist, forKey: watchlistKey)
+        queueSync("list", key, on: watchlist.contains(key))
     }
 
     // MARK: Favoritos (por cuenta, guardados en el dispositivo)
@@ -144,6 +230,7 @@ final class Session: ObservableObject {
         let id = Session.favoriteID(s)
         if favorites.contains(id) { favorites.remove(id) } else { favorites.insert(id) }
         UserDefaults.standard.set(Array(favorites), forKey: favoritesKey)
+        queueSync("fav", id, on: favorites.contains(id))
     }
 
     // MARK: Visto (pelis y capítulos terminados)
@@ -268,6 +355,7 @@ final class Session: ObservableObject {
                 Keychain.save(c)
                 apply(c)
                 account = info
+                scheduleSync()
                 await refreshResume()
                 return
             } catch APIError.auth {
@@ -331,6 +419,7 @@ final class Session: ObservableObject {
     }
 
     func logout() {
+        syncDebounce?.cancel()
         Keychain.delete()
         DiskCache.clear()
         LocalResume.clear()

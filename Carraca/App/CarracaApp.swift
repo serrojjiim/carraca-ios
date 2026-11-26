@@ -126,7 +126,10 @@ struct RootView: View {
         .seasonTint()
         .task { await ThemeStore.shared.refresh(force: true) }
         .onChange(of: phase) { p in
-            if p == .active { Task { await ThemeStore.shared.refresh() } }
+            if p == .active {
+                Task { await ThemeStore.shared.refresh() }
+                session.scheduleSync()     // favoritos y Mi lista: al volver a la app
+            }
         }
         .onOpenURL { session.handle(url: $0) }
         .alert("Nueva versión disponible",
