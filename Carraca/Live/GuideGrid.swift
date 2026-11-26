@@ -11,8 +11,12 @@ final class GuideGrid: ObservableObject {
     static let batch = 80
 
     @Published private(set) var programs: [String: [GuideEntry]] = [:]
+    /// Descargas en curso (contador: dos a la vez no apagan el indicador antes de tiempo).
+    private var inFlight = 0
     @Published private(set) var loading = false
-    @Published private(set) var failed = false
+    /// Canales cuya guía no se pudo bajar. Reintentar las pide otra vez.
+    @Published private(set) var failedIDs: Set<String> = []
+    var failed: Bool { !failedIDs.isEmpty }
 
     /// Ventana fija: 1 h antes de la hora actual (redondeada a media hora) durante 12 h.
     /// Así from >= ahora-6 h y to-from <= 12 h, como exige el servidor.
@@ -23,7 +27,7 @@ final class GuideGrid: ObservableObject {
     private var queue: Set<String> = []
     private var flushTask: Task<Void, Never>?
 
-    static func windowStart(now: Date = Date()) -> Date {
+    nonisolated static func windowStart(now: Date = Date()) -> Date {
         let base = now.timeIntervalSince1970 - 3600
         return Date(timeIntervalSince1970: floor(base / 1800) * 1800)
     }
@@ -36,16 +40,22 @@ final class GuideGrid: ObservableObject {
         queue.formUnion(fresh)
         flushTask?.cancel()
         flushTask = Task { [weak self] in
-            // Agrupa las filas que aparecen a la vez al hacer scroll.
+            // Solo espera (agrupa las filas que aparecen a la vez al hacer scroll).
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
-            await self?.flush()
+            self?.startFlush()
         }
     }
 
-    /// Reintento tras un error: vuelve a pedir lo que falló.
+    /// La descarga va en su propia tarea, sin guardarla: cancelar el debounce no la afecta.
+    private func startFlush() {
+        Task { [weak self] in await self?.flush() }
+    }
+
+    /// Reintento tras un error: vuelve a pedir esos canales.
     func retry(_ ids: [String]) {
         requested.subtract(ids)
+        failedIDs.subtract(ids)
         request(ids)
     }
 
@@ -53,8 +63,12 @@ final class GuideGrid: ObservableObject {
         let ids = Array(queue).sorted()
         queue = []
         guard !ids.isEmpty else { return }
+        inFlight += 1
         loading = true
-        defer { loading = false }
+        defer {
+            inFlight -= 1
+            loading = inFlight > 0
+        }
         let from = Int(start.timeIntervalSince1970)
         let to = Int(end.timeIntervalSince1970)
         var offset = 0
@@ -62,12 +76,16 @@ final class GuideGrid: ObservableObject {
             let part = Array(ids[offset..<min(offset + Self.batch, ids.count)])
             offset += Self.batch
             if let got = await Self.fetch(ids: part, from: from, to: to) {
-                for id in part { programs[id] = got[id] ?? [] }
-                failed = false
+                for id in part {
+                    programs[id] = got[id] ?? []
+                    failedIDs.remove(id)
+                }
             } else {
-                // Se quita de "pedido" para que vuelva a intentarse al aparecer otra vez.
-                for id in part { requested.remove(id) }
-                failed = true
+                // Se quita de "pedido" para que vuelva a pedirse al aparecer, y queda marcado.
+                for id in part {
+                    requested.remove(id)
+                    failedIDs.insert(id)
+                }
             }
         }
     }
@@ -218,6 +236,21 @@ struct GuideGridView: View {
         .overlay(alignment: .topTrailing) {
             if grid.loading { ProgressView().padding(8) }
         }
+        .overlay(alignment: .bottom) {
+            if grid.failed {
+                HStack(spacing: 10) {
+                    Text("Parte de la guía no se ha cargado.")
+                        .font(.footnote)
+                    Spacer(minLength: 8)
+                    Button("Reintentar") { grid.retry(Array(grid.failedIDs)) }
+                        .font(.footnote.weight(.semibold))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .padding(12)
+            }
+        }
     }
 
     /// Horas cada 30 minutos, en la misma franja horizontal que las filas.
@@ -299,7 +332,8 @@ struct GuideGridView: View {
         let reminded = reminders.isReminded(channelKey: Session.favoriteID(s), start: e.start)
         let when = e.start.formatted(date: .omitted, time: .shortened)
         return Button {
-            picked = GuidePick(channel: s, entry: e)
+            // En emisión: al canal. Futuro: el menú de "Avisarme".
+            if live { play(s) } else { picked = GuidePick(channel: s, entry: e) }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
@@ -352,7 +386,7 @@ struct GuideGridView: View {
             Image(systemName: "wifi.exclamationmark").font(.largeTitle).foregroundStyle(.secondary)
             Text("No se ha podido cargar la guía.").foregroundStyle(.secondary)
             Button("Reintentar") {
-                grid.retry(visible.prefix(GuideGrid.batch).compactMap(\.epgId))
+                grid.retry(Array(grid.failedIDs))
             }
             .buttonStyle(.borderedProminent)
         }
@@ -361,6 +395,8 @@ struct GuideGridView: View {
     }
 
     private func play(_ s: LiveStream) {
+        // Una sola conexión: se para la vista previa de la lista (iPad) antes de reproducir.
+        NotificationCenter.default.post(name: .stopChannelPreviews, object: nil)
         playing = makeItem(s, allInCategory)
     }
 

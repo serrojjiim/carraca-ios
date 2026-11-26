@@ -57,6 +57,8 @@ struct ChannelListView: View {
         .searchable(text: $query, prompt: "Buscar en \(title)")
         .onDisappear { stopPreview() }
         .onChange(of: phase) { p in if p != .active { stopPreview() } }
+        // La guía o un aviso de programa van a reproducir: la vista previa se para antes (una sola conexión)
+        .onReceive(NotificationCenter.default.publisher(for: .stopChannelPreviews)) { _ in stopPreview() }
         .task(id: gridKey(channels)) {
             index = await makeSearchIndex(channels) { $0.name }
             indexVersion += 1
@@ -188,6 +190,11 @@ struct ChannelListView: View {
         selected = s
         playing = makeItem(s, list)
     }
+}
+
+extension Notification.Name {
+    /// Para la vista previa de canales (iPad) antes de abrir otra reproducción.
+    static let stopChannelPreviews = Notification.Name("carraca.stopChannelPreviews")
 }
 
 extension Category {

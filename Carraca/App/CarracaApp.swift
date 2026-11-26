@@ -142,6 +142,7 @@ struct RootView: View {
             if p == .active {
                 Task { await ThemeStore.shared.refresh() }
                 session.scheduleSync()     // favoritos y Mi lista: al volver a la app
+                ProgramReminders.shared.prune()
             }
         }
         .onOpenURL { session.handle(url: $0) }

@@ -38,6 +38,10 @@ struct LiveView: View {
         .onReceive(NotificationCenter.default.publisher(for: AppDelegate.openChannel)) { _ in
             openPendingChannel()
         }
+        .onChange(of: showGuide) { on in
+            // Una sola conexión: la vista previa de la lista (iPad) se para al abrir la guía
+            if on { NotificationCenter.default.post(name: .stopChannelPreviews, object: nil) }
+        }
         .fullScreenCover(isPresented: $showGuide) {
             GuideGridView(categories: guideCategories, initial: .all,
                           title: { title(of: $0) },
@@ -358,6 +362,7 @@ struct LiveView: View {
         guard let key = AppDelegate.pendingChannelKey, !streams.isEmpty else { return }
         AppDelegate.pendingChannelKey = nil
         guard let s = streams.first(where: { Session.favoriteID($0) == key }) else { return }
+        NotificationCenter.default.post(name: .stopChannelPreviews, object: nil)
         play(s, in: byCategory[s.categoryId] ?? [s])
     }
 
