@@ -32,7 +32,7 @@ struct LiveView: View {
             if hsize == .regular { splitBody } else { stackBody }
         }
         .task {
-            if streams.isEmpty { await load() }
+            if streams.isEmpty { await load(measure: true) }
             await session.refreshGuide()
         }
         .onReceive(NotificationCenter.default.publisher(for: AppDelegate.openChannel)) { _ in
@@ -306,16 +306,19 @@ struct LiveView: View {
         }
     }
 
+    /// `measure`: solo la carga de entrada (no silenciosa) se mide para telemetría; los refrescos no.
     @MainActor
-    private func load(force: Bool = false) async {
+    private func load(force: Bool = false, measure: Bool = false) async {
         loading = true
         defer { loading = false }
+        let t0 = Date()
+        var cacheSrc = "none"
         do {
             var cats: [Category]
             let loaded: [LiveStream]
             if session.isM3U {
                 // En M3U las categorías salen de group-title, en el orden de la lista.
-                loaded = try await session.m3uChannels(force: force)
+                loaded = try await session.m3uChannels(force: force, source: { cacheSrc = $0 })
                 var seen = Set<String>()
                 cats = []
                 for s in loaded where seen.insert(s.categoryId).inserted {
@@ -324,7 +327,7 @@ struct LiveView: View {
             } else {
                 guard let api = session.api else { return }
                 cats = try await api.liveCategories(force: force)
-                loaded = try await api.liveStreams(force: force)
+                loaded = try await api.liveStreams(force: force, source: { cacheSrc = $0 })
             }
             let all = loaded.filter { !$0.isSeparator }
             var cnt: [String: Int] = [:]
@@ -342,6 +345,9 @@ struct LiveView: View {
             favs = all.filter { session.isFavorite($0) }
             categories = cats.filter { (cnt[$0.id] ?? 0) > 0 }
             streams = all
+            if measure {
+                Telemetry.shared.noteList(ms: Int(Date().timeIntervalSince(t0) * 1000), n: all.count, cache: cacheSrc)
+            }
             index = await makeSearchIndex(all) { $0.name }
             error = nil
             openPendingChannel()
