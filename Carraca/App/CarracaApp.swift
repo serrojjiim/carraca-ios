@@ -99,6 +99,7 @@ struct CarracaApp: App {
     @StateObject private var store = Store()
 
     init() {
+        Telemetry.shared.start()
         ReviewPrompt.countLaunch()
         ImageLoader.trim()
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
@@ -139,11 +140,17 @@ struct RootView: View {
         .animation(.easeInOut(duration: 0.4), value: theme.current?.id)
         .seasonTint()
         .task { await ThemeStore.shared.refresh(force: true) }
+        .onAppear {
+            Telemetry.shared.logStart()        // primera pantalla útil (una vez por arranque)
+            Telemetry.shared.flushAtLaunch()   // envío del buffer anterior, con retardo
+        }
         .onChange(of: phase) { p in
             if p == .active {
                 Task { await ThemeStore.shared.refresh() }
                 session.scheduleSync()     // favoritos y Mi lista: al volver a la app
                 ProgramReminders.shared.prune()
+            } else if p == .background {
+                Telemetry.shared.flush()   // envío al salir (con sus límites; nunca durante una reproducción)
             }
         }
         .onOpenURL { session.handle(url: $0) }

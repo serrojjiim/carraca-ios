@@ -16,6 +16,7 @@ struct SettingsView: View {
     @AppStorage(DownloadPrefs.autoDeleteKey) private var autoDelete = false
     @AppStorage(ThemeStore.decorKey) private var decor = true
     @AppStorage(ProgramReminders.leadKey) private var remindLead = 5
+    @AppStorage(Telemetry.enabledKey) private var telemetryOn = true
     @ObservedObject private var theme = ThemeStore.shared
     @ObservedObject private var alerts = ProgramReminders.shared
 
@@ -140,6 +141,15 @@ struct SettingsView: View {
                     }
                 } footer: {
                     Text("Las listas se guardan 12 horas para que la app vaya rápida.")
+                }
+                Section {
+                    Toggle("Enviar datos de uso anónimos", isOn: $telemetryOn)
+                        .onChange(of: telemetryOn) { on in
+                            // al apagarlo: se borra lo pendiente y se cambia el identificador anónimo
+                            if !on { Telemetry.shared.disable() }
+                        }
+                } footer: {
+                    Text("Ayuda a mejorar la reproducción: errores, cortes y tiempos. No incluye usuario, contraseña, direcciones ni lo que ves.")
                 }
                 Section {
                     Button("Cerrar sesión", role: .destructive) { confirmLogout = true }
