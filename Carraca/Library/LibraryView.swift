@@ -64,7 +64,7 @@ struct LibraryView: View {
     private var resumeList: some View {
         List(session.resume) { item in
             row(item)
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                .swipeActions(edge: .trailing) {
                     Button(role: .destructive) { session.removeResume(item) } label: {
                         Label("Quitar", systemImage: "trash")
                     }
@@ -152,7 +152,7 @@ struct LibraryView: View {
                         NavigationLink(value: s) { savedRow(s.title, s.cover, kind: "Serie", year: s.year, watched: false) }
                     }
                 }
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                .swipeActions(edge: .trailing) {
                     Button(role: .destructive) { session.toggleList(it.id) } label: {
                         Label("Quitar", systemImage: "bookmark.slash")
                     }

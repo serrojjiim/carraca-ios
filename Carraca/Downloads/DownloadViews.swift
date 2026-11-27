@@ -107,7 +107,7 @@ struct DownloadsList: View {
                 Section {
                     ForEach(downloads.items) { it in
                         row(it)
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            .swipeActions(edge: .trailing) {
                                 Button(role: .destructive) { downloads.remove(it.id) } label: { Label("Borrar", systemImage: "trash") }
                             }
                     }

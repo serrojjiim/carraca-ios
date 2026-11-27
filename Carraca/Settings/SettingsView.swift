@@ -8,6 +8,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var manage = false
     @State private var confirmLogout = false
+    @State private var confirmAutoDelete = false
     @AppStorage(PlaybackPrefs.audioKey) private var prefAudio = ""
     @AppStorage(PlaybackPrefs.subsKey) private var prefSubs = ""
     @AppStorage(PlaybackPrefs.autoNextKey) private var prefAutoNext = true
@@ -111,7 +112,10 @@ struct SettingsView: View {
                         .onChange(of: wifiOnly) { _ in Downloads.shared.networkPolicyChanged() }
                     Toggle("Borrar lo ya visto", isOn: $autoDelete)
                         .onChange(of: autoDelete) { on in
-                            if on { Downloads.shared.removeWatched(session.isWatched(download:)) }
+                            // al activarlo borra ya las descargas vistas: primero se pregunta
+                            if on, Downloads.shared.items.contains(where: session.isWatched(download:)) {
+                                confirmAutoDelete = true
+                            }
                         }
                 } header: {
                     Text("Descargas")
@@ -148,6 +152,14 @@ struct SettingsView: View {
                 }
             }
             .manageSubscriptionsSheet(isPresented: $manage)
+            .confirmationDialog("¿Borrar las descargas ya vistas?", isPresented: $confirmAutoDelete, titleVisibility: .visible) {
+                Button("Borrar", role: .destructive) {
+                    Downloads.shared.removeWatched(session.isWatched(download:))
+                }
+                Button("Cancelar", role: .cancel) { autoDelete = false }
+            } message: {
+                Text("Se borrarán del iPhone las descargas que ya has visto. No se puede deshacer.")
+            }
             .confirmationDialog("¿Cerrar sesión?", isPresented: $confirmLogout, titleVisibility: .visible) {
                 Button("Cerrar sesión", role: .destructive) {
                     session.logout()
