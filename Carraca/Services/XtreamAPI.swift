@@ -59,15 +59,19 @@ final class XtreamAPI: @unchecked Sendable {
     ///   por detrás (al acabar se avisa con `listRefreshed`). Así no hay pantalla de carga cada 12 h.
     func get<T: Decodable>(_ type: T.Type, _ action: String?, _ extra: [String: String] = [:],
                            cache: String? = nil, maxAge: TimeInterval = 0, force: Bool = false,
-                           stale: Bool = false) async throws -> T {
+                           stale: Bool = false, source: ((String) -> Void)? = nil) async throws -> T {
         let key = cache.map { cachePrefix + "_" + $0 }
         if let key, !force, maxAge > 0 {
             // 1) en memoria: las listas grandes (12.000 pelis) ya decodificadas, para no leerlas
             //    y decodificarlas de nuevo en cada pantalla (Películas, Seguir viendo, Buscar, Descargas…)
             if let e: (value: T, at: Date) = MemCache.shared.entry(key) {
-                if Date().timeIntervalSince(e.at) < maxAge { return e.value }
+                if Date().timeIntervalSince(e.at) < maxAge {
+                    source?("hit")
+                    return e.value
+                }
                 if stale, let cache {
                     refreshInBackground(T.self, action, extra, key: key, name: cache, maxAge: maxAge)
+                    source?("hit")
                     return e.value
                 }
             }
@@ -78,15 +82,19 @@ final class XtreamAPI: @unchecked Sendable {
                 if Date().timeIntervalSince(hit.1) >= maxAge, let cache {
                     refreshInBackground(T.self, action, extra, key: key, name: cache, maxAge: maxAge)
                 }
+                source?("hit")
                 return value
             }
         }
         do {
-            return try await fetch(T.self, action, extra, key: key, maxAge: maxAge)
+            let value = try await fetch(T.self, action, extra, key: key, maxAge: maxAge)
+            source?("miss")
+            return value
         } catch {
             // Sin red o el servidor falla: mejor la lista que ya teníamos (aunque sea vieja) que una pantalla de error.
             if let key, maxAge > 0, let data = DiskCache.read(key, maxAge: .infinity),
                let value = try? JSONDecoder().decode(T.self, from: data) {
+                source?("hit")
                 return value
             }
             throw error
@@ -142,8 +150,9 @@ final class XtreamAPI: @unchecked Sendable {
     func liveCategories(force: Bool = false) async throws -> [Category] {
         try await get(LossyArray<Category>.self, "get_live_categories", cache: "live_cat", maxAge: Self.listAge, force: force, stale: true).items
     }
-    func liveStreams(force: Bool = false) async throws -> [LiveStream] {
-        try await get(LossyArray<LiveStream>.self, "get_live_streams", cache: "live", maxAge: Self.listAge, force: force, stale: true).items
+    /// `source` (opcional, para telemetría): "hit" si se sirve la copia guardada, "miss" si se bajó del servidor.
+    func liveStreams(force: Bool = false, source: ((String) -> Void)? = nil) async throws -> [LiveStream] {
+        try await get(LossyArray<LiveStream>.self, "get_live_streams", cache: "live", maxAge: Self.listAge, force: force, stale: true, source: source).items
     }
     func vodCategories(force: Bool = false) async throws -> [Category] {
         try await get(LossyArray<Category>.self, "get_vod_categories", cache: "vod_cat", maxAge: Self.listAge, force: force, stale: true).items

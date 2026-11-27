@@ -378,14 +378,15 @@ final class Session: ObservableObject {
     }
 
     /// Canales de la lista M3U (caché 12 h).
-    func m3uChannels(force: Bool = false) async throws -> [LiveStream] {
+    /// `source` (opcional, telemetría): "hit" si sale de la copia guardada, "miss" si se bajó.
+    func m3uChannels(force: Bool = false, source: ((String) -> Void)? = nil) async throws -> [LiveStream] {
         guard let s = creds?.m3u, let url = URL(string: s) else { return [] }
-        return try await fetchM3U(url, force: force)
+        return try await fetchM3U(url, force: force, source: source)
     }
 
     private var m3uRefreshing = false
 
-    private func fetchM3U(_ url: URL, force: Bool) async throws -> [LiveStream] {
+    private func fetchM3U(_ url: URL, force: Bool, source: ((String) -> Void)? = nil) async throws -> [LiveStream] {
         // Hash estable (djb2): hashValue cambia en cada arranque.
         let h = url.absoluteString.utf8.reduce(UInt64(5381)) { ($0 &<< 5) &+ $0 &+ UInt64($1) }
         let key = "m3u_" + String(h, radix: 16)
@@ -394,6 +395,7 @@ final class Session: ObservableObject {
             let data = hit.0
             let list = await Task.detached(priority: .userInitiated) { M3U.parse(data: data) }.value
             if !list.isEmpty {
+                source?("hit")
                 if Date().timeIntervalSince(hit.1) >= XtreamAPI.listAge && !m3uRefreshing {
                     m3uRefreshing = true
                     Task {
@@ -405,7 +407,9 @@ final class Session: ObservableObject {
                 return list
             }
         }
-        return try await downloadM3U(url, key: key)
+        let fresh = try await downloadM3U(url, key: key)
+        source?("miss")
+        return fresh
     }
 
     private func downloadM3U(_ url: URL, key: String) async throws -> [LiveStream] {
