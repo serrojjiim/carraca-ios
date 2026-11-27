@@ -299,7 +299,8 @@ final class Telemetry: @unchecked Sendable {
         var size = MemoryLayout<kinfo_proc>.stride
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
         guard sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
-        let tv = info.kp_proc.p_starttime
+        // p_starttime es una macro de C para p_un.__p_starttime: en Swift se usa el nombre real
+        let tv = info.kp_proc.p_un.__p_starttime
         let started = TimeInterval(tv.tv_sec) + TimeInterval(tv.tv_usec) / 1_000_000
         let ms = (Date().timeIntervalSince1970 - started) * 1000
         return (ms > 0 && ms < 600_000) ? Int(ms) : nil
@@ -341,10 +342,10 @@ final class MetricKitSubscriber: NSObject, MXMetricManagerSubscriber {
         5: "EXC_SOFTWARE", 6: "EXC_BREAKPOINT", 10: "EXC_CRASH", 11: "EXC_RESOURCE", 12: "EXC_GUARD"
     ]
 
-    /// "SIGSEGV/EXC_BAD_ACCESS": texto corto, sin mensaje.
+    /// "SIGSEGV/EXC_BAD_ACCESS": texto corto, sin mensaje. Sin "?" (el filtro del buffer y el servidor lo rechazan).
     private static func crashClass(sig: Int?, exc: Int?) -> String {
-        let s = sig.map { signalNames[$0] ?? "SIG\($0)" } ?? "SIG?"
-        let e = exc.map { exceptionNames[$0] ?? "EXC\($0)" } ?? "EXC?"
+        let s = sig.map { signalNames[$0] ?? "SIG\($0)" } ?? "SIG0"
+        let e = exc.map { exceptionNames[$0] ?? "EXC\($0)" } ?? "EXC0"
         return "\(s)/\(e)"
     }
 
@@ -358,7 +359,7 @@ final class MetricKitSubscriber: NSObject, MXMetricManagerSubscriber {
         var node = (stack?["callStackRootFrames"] as? [[String: Any]]) ?? []
         var out: [String] = []
         while out.count < 8, let frame = node.max(by: { ($0["sampleCount"] as? Int ?? 0) < ($1["sampleCount"] as? Int ?? 0) }) {
-            let name = (frame["binaryName"] as? String) ?? "?"
+            let name = (frame["binaryName"] as? String) ?? "unknown"
             let off = (frame["offsetIntoBinaryTextSegment"] as? Int) ?? 0
             out.append(name + ":" + String(off, radix: 16))
             node = (frame["subFrames"] as? [[String: Any]]) ?? []
@@ -382,9 +383,7 @@ final class MetricKitSubscriber: NSObject, MXMetricManagerSubscriber {
         if let mem = p.memoryMetrics?.peakMemoryUsage {
             f["mem_peak_mb"] = .i(Int(mem.converted(to: .megabytes).value))
         }
-        if let hitch = p.animationMetrics?.scrollHitchTimeRatio {
-            f["hitch_pct"] = .i(max(0, min(1000, Int(hitch.value * 1000))))
-        }
+        // hitch_pct se omite a propósito: no está confirmada la unidad de scrollHitchTimeRatio
         return f
     }
 
