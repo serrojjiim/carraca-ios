@@ -1,6 +1,8 @@
 import Foundation
 import UIKit
 import MetricKit
+import Network
+import os
 
 // Telemetría anónima (contrato: carraca-android/tools/telemetria/SCHEMA.md; servidor: telemetria.php).
 // Nunca se envía: usuario, contraseña, URLs, nombres de canal/película, IP ni identificadores del aparato
@@ -67,6 +69,7 @@ final class Telemetry: @unchecked Sendable {
     /// Llamar una vez al arrancar la app: MetricKit, aviso de poca memoria y carga del buffer guardado.
     func start() {
         _ = Self.installID
+        NetMonitor.shared.start()
         _ = NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification,
                                                    object: nil, queue: nil) { _ in
             Telemetry.shared.log("lowmem", ["lvl": .i(1),
@@ -295,6 +298,26 @@ final class Telemetry: @unchecked Sendable {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
+    /// Tipo de red activa (wifi, eth, cell, none, other), o nil si aún no se ha medido.
+    static var netType: String? { NetMonitor.shared.current }
+
+    /// RAM que el sistema deja disponible a esta app (MB), o nil si no se sabe (0 en el simulador).
+    static func availableMemoryMB() -> Int? {
+        let bytes = os_proc_available_memory()
+        return bytes > 0 ? Int(bytes / 1_048_576) : nil
+    }
+
+    /// Texto corto seguro para el esquema: solo letras, cifras y `_ . $ < > : ( ) [ ] / espacio -`.
+    /// Devuelve nil si está vacío, es demasiado largo o trae cualquier otro carácter.
+    static func safeText(_ s: String, max: Int = 24) -> String? {
+        let extra = Set("_.$<>:()[]/ -")
+        guard !s.isEmpty, s.count <= max else { return nil }
+        let ok = s.allSatisfy { c in
+            (c.isASCII && (c.isLetter || c.isNumber)) || extra.contains(c)
+        }
+        return ok ? s : nil
+    }
+
     /// Identificador anónimo de la instalación (UUID v4 en minúsculas, como exige el servidor).
     static var installID: String {
         let d = UserDefaults.standard
@@ -336,6 +359,50 @@ final class Telemetry: @unchecked Sendable {
         let started = TimeInterval(tv.tv_sec) + TimeInterval(tv.tv_usec) / 1_000_000
         let ms = (Date().timeIntervalSince1970 - started) * 1000
         return (ms > 0 && ms < 600_000) ? Int(ms) : nil
+    }
+}
+
+/// Tipo de red activa para la telemetría. Un único monitor ligero; el último valor se lee desde el hilo principal.
+final class NetMonitor: @unchecked Sendable {
+    static let shared = NetMonitor()
+
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "carraca.telemetry.net", qos: .utility)
+    private let lock = NSLock()
+    private var kind: String?      // protegido por lock
+    private var started = false    // protegido por lock
+
+    private init() {}
+
+    func start() {
+        lock.lock()
+        let already = started
+        started = true
+        lock.unlock()
+        guard !already else { return }
+        monitor.pathUpdateHandler = { [weak self] path in
+            let k = NetMonitor.kind(of: path)
+            guard let self else { return }
+            self.lock.lock()
+            self.kind = k
+            self.lock.unlock()
+        }
+        monitor.start(queue: queue)
+    }
+
+    /// Último tipo medido, o nil si todavía no ha llegado ninguna actualización.
+    var current: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return kind
+    }
+
+    private static func kind(of path: NWPath) -> String {
+        guard path.status == .satisfied else { return "none" }
+        if path.usesInterfaceType(.wifi) { return "wifi" }
+        if path.usesInterfaceType(.wiredEthernet) { return "eth" }
+        if path.usesInterfaceType(.cellular) { return "cell" }
+        return "other"
     }
 }
 
