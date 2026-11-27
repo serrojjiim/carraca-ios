@@ -424,6 +424,8 @@ final class Session: ObservableObject {
         Keychain.delete()
         DiskCache.clear()
         LocalResume.clear()
+        // lo descargado con esta cuenta no debe verse desde otra en el mismo iPhone
+        Downloads.shared.removeAll()
         creds = nil
         api = nil
         account = nil
@@ -500,7 +502,7 @@ final class Session: ObservableObject {
         }
 
         if !remoteResume {
-            LocalResume.upsert(ResumeItem(type: r.type, name: r.name, itemId: r.itemId, url: item.url.absoluteString,
+            LocalResume.upsert(ResumeItem(type: r.type, name: r.name, itemId: r.itemId, url: LocalResume.masked(item.url.absoluteString),
                                           season: r.season, episode: r.episode, position: timeMs,
                                           duration: lengthMs, pro: pro, ts: Int(Date().timeIntervalSince1970)))
             return
@@ -528,10 +530,20 @@ final class Session: ObservableObject {
 enum LocalResume {
     private static let key = "carraca.resume"
 
+    /// /movie/usuario/clave/ -> /movie/-/-/ (en el dispositivo la URL se guarda sin credenciales;
+    /// Session.playableURL las vuelve a poner al reproducir).
+    static func masked(_ raw: String) -> String {
+        raw.replacingOccurrences(of: #"/(movie|series)/[^/]+/[^/]+/"#, with: "/$1/-/-/", options: .regularExpression)
+    }
+
     static func load() -> [ResumeItem] {
         guard let d = UserDefaults.standard.data(forKey: key),
               let list = try? JSONDecoder().decode([ResumeItem].self, from: d) else { return [] }
-        return list
+        // lo guardado por versiones anteriores llevaba usuario y contraseña dentro: se limpia al leer
+        return list.map {
+            ResumeItem(type: $0.type, name: $0.name, itemId: $0.itemId, url: masked($0.url), season: $0.season,
+                       episode: $0.episode, position: $0.position, duration: $0.duration, pro: $0.pro, ts: $0.ts)
+        }
     }
 
     static func upsert(_ item: ResumeItem) {

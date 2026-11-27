@@ -7,6 +7,7 @@ struct SettingsView: View {
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
     @State private var manage = false
+    @State private var confirmLogout = false
     @AppStorage(PlaybackPrefs.audioKey) private var prefAudio = ""
     @AppStorage(PlaybackPrefs.subsKey) private var prefSubs = ""
     @AppStorage(PlaybackPrefs.autoNextKey) private var prefAutoNext = true
@@ -137,10 +138,7 @@ struct SettingsView: View {
                     Text("Las listas se guardan 12 horas para que la app vaya rápida.")
                 }
                 Section {
-                    Button("Cerrar sesión", role: .destructive) {
-                        session.logout()
-                        dismiss()
-                    }
+                    Button("Cerrar sesión", role: .destructive) { confirmLogout = true }
                 }
                 Section {
                     LabeledContent("Versión", value: "\(AppConfig.version) (\(AppConfig.build))")
@@ -150,6 +148,15 @@ struct SettingsView: View {
                 }
             }
             .manageSubscriptionsSheet(isPresented: $manage)
+            .confirmationDialog("¿Cerrar sesión?", isPresented: $confirmLogout, titleVisibility: .visible) {
+                Button("Cerrar sesión", role: .destructive) {
+                    session.logout()
+                    dismiss()
+                }
+                Button("Cancelar", role: .cancel) {}
+            } message: {
+                Text("Se borrarán también las descargas guardadas en este iPhone.")
+            }
             .seasonTint()
             .navigationTitle("Ajustes")
             .navigationBarTitleDisplayMode(.inline)

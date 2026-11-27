@@ -67,6 +67,10 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var url: URL?
     private var live = false
     private var retries = 0
+    /// Última vez que se programó un reintento (los reintentos solo se ponen a 0 tras 30 s de imagen estable).
+    private var lastRetryAt = Date.distantPast
+    /// true mientras se espera para preguntar al servidor por qué ha fallado (antes del primer reintento).
+    private var probing = false
     private var muted = false
     /// true tras halt(): los reintentos pendientes ya no deben arrancar nada.
     private var halted = false
@@ -99,6 +103,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         self.muted = muted
         halted = false
         seekTarget = nil
+        probing = false
         failed = false
         failReason = .generic
         ended = false
@@ -130,6 +135,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func checkStall() {
         guard !halted, !failed, !ended, let url else { return }
         if player.state == .paused { lastProgress = Date(); return }
+        // reproduciendo con normalidad desde hace un rato: los reintentos vuelven a empezar
+        if retries > 0, Date().timeIntervalSince(lastRetryAt) > 30, Date().timeIntervalSince(lastProgress) < 6 { retries = 0 }
         let stalled = Date().timeIntervalSince(lastProgress)
         guard stalled > (live ? 15 : 25), Date().timeIntervalSince(lastStallRestart) > 60 else { return }
         if stallRestarts >= 3 {
@@ -137,6 +144,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             buffering = false
             playing = false
             watchdog?.invalidate()
+            player.stop()          // se suelta la conexión: el diagnóstico no debe ser una segunda
             diagnose(url)
             return
         }
@@ -206,6 +214,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func stop() {
+        halted = true      // ningún reintento pendiente puede reabrir el canal después de cerrar
         watchdog?.invalidate()
         watchdog = nil
         player.delegate = nil
@@ -314,7 +323,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             case .playing:
                 self.buffering = false
                 self.playing = true
-                self.retries = 0
+                // (los reintentos NO se ponen a 0 aquí: un canal que arranca y se cae otra vez reintentaría sin tope)
                 if !self.prefsApplied, !self.muted {
                     self.prefsApplied = true
                     // las pistas aparecen un instante después de empezar
@@ -341,6 +350,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func mediaPlayerTimeChanged(_ aNotification: Notification) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // con el flujo cortado (fallo o comprobación en curso) VLC da 0: se conserva el último punto bueno
+            if self.failed || self.probing { return }
             let t = Int(self.player.time.intValue)
             if t != self.lastSeenTime {
                 // avanza: el vigilante se queda tranquilo
@@ -362,19 +373,55 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     /// Como mucho 3 reintentos y con pausa creciente: el proveedor banea las ráfagas.
+    /// Antes del primero se suelta la conexión y se pregunta UNA vez al servidor por qué ha fallado: si es
+    /// "cuenta en uso", bloqueo o retirado, no se insiste (otro aparato tiene la conexión y se pelearían).
     private func handleError() {
         if halted { return }
+        // vista previa (sin sonido): nunca reintenta ni pregunta; se queda en "no disponible"
+        if muted {
+            player.stop()
+            failed = true
+            buffering = false
+            playing = false
+            return
+        }
         guard retries < 3, let url else {
             failed = true
             buffering = false
             playing = false
-            if let url { diagnose(url) }
+            if let url { player.stop(); diagnose(url) }
+            return
+        }
+        let resumeAt = live ? 0 : (seekTarget ?? timeMs)
+        let isLive = live
+        if retries == 0, !url.isFileURL {
+            if probing { return }
+            probing = true
+            buffering = true
+            player.stop()
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self else { return }
+                self.probing = false
+                guard !self.halted, self.url == url else { return }
+                let reason = await VLCController.probe(url)
+                guard !self.halted, self.url == url else { return }
+                if reason == .blocked || reason == .busy || reason == .missing {
+                    self.failReason = reason
+                    self.failed = true
+                    self.buffering = false
+                    self.playing = false
+                    return
+                }
+                self.retries = 1
+                self.lastRetryAt = Date()
+                self.start(url: url, startMs: resumeAt, live: isLive, muted: false)
+            }
             return
         }
         retries += 1
+        lastRetryAt = Date()
         buffering = true
-        let resumeAt = live ? 0 : (seekTarget ?? timeMs)
-        let isLive = live
         let isMuted = muted
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(3 * retries)) { [weak self] in
             guard let self, !self.halted, self.url == url else { return }
@@ -386,30 +433,36 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 extension VLCController {
     /// Una sola petición (solo cabeceras, se corta en cuanto responde) para saber qué ha pasado:
     /// cuenta en uso en otro sitio, IP bloqueada, contenido retirado, servidor caído o sin internet.
-    func diagnose(_ url: URL) {
-        if url.isFileURL { failReason = .file; return }
-        failReason = .checking
+    static func probe(_ url: URL) async -> FailReason {
         var req = URLRequest(url: url, timeoutInterval: 8)
         req.setValue("bytes=0-0", forHTTPHeaderField: "Range")
         req.setValue("CarracaiOS/\(AppConfig.version)", forHTTPHeaderField: "User-Agent")
-        Task { @MainActor [weak self] in
-            var reason = FailReason.generic
-            do {
-                let (bytes, resp) = try await URLSession.shared.bytes(for: req)
-                bytes.task.cancel()
-                switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
-                case 401, 403, 407, 423, 451: reason = .blocked
-                case 429, 456...462, 509: reason = .busy
-                case 404, 410, 551: reason = .missing
-                case 500...599: reason = .server
-                default: reason = .generic
-                }
-            } catch let e as URLError where [URLError.Code.notConnectedToInternet, .networkConnectionLost, .dataNotAllowed].contains(e.code) {
-                reason = .offline
-            } catch {
-                reason = .generic
+        do {
+            let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+            bytes.task.cancel()
+            switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
+            case 401, 403, 407, 423, 451: return .blocked
+            case 429, 456...462, 509: return .busy
+            case 404, 410, 551: return .missing
+            case 500...599: return .server
+            default: return .generic
             }
-            self?.failReason = reason
+        } catch let e as URLError where [URLError.Code.notConnectedToInternet, .networkConnectionLost, .dataNotAllowed].contains(e.code) {
+            return .offline
+        } catch {
+            return .generic
+        }
+    }
+
+    /// Diagnóstico al rendirse (el motor ya está parado). Espera un momento a que el proveedor suelte la
+    /// conexión anterior: si no, la respuesta sería un falso "cuenta en uso".
+    func diagnose(_ url: URL) {
+        if url.isFileURL { failReason = .file; return }
+        failReason = .checking
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self, !self.halted else { return }
+            self.failReason = await VLCController.probe(url)
         }
     }
 }

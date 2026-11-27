@@ -177,6 +177,9 @@ struct PlayerView: View {
         .onDisappear {
             report()
             alive = false
+            // un cambio de canal pendiente no debe abrir el canal después de cerrar (conexión fantasma contra el límite de 1)
+            zapWork?.cancel()
+            zapWork = nil
             if let b = originalBrightness { UIScreen.main.brightness = b }
             // el último canal se guardó sin avisar; ahora sí, para "Seguir viendo · canal"
             if item.isLive { session.objectWillChange.send() }

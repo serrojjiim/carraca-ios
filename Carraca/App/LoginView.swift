@@ -103,7 +103,17 @@ struct LoginView: View {
             m3u = p.m3u
         } else {
             mode = .xtream
-            server = p.server
+            // El enlace puede venir de cualquier web: en la versión privada solo vale el servidor Carraca (si no, alguien
+            // podría hacerte teclear tu clave en el suyo). En la otra se rellena, pero avisando de a qué servidor apunta.
+            let host = URL(string: p.server)?.host ?? p.server
+            if !p.server.isEmpty, Flavor.isPrivate, !CarracaServers.isCarraca(p.server) {
+                error = "El enlace apuntaba a otro servidor (\(host)) y se ha ignorado."
+            } else {
+                if !p.server.isEmpty { server = p.server }
+                if !p.server.isEmpty, !Flavor.isPrivate {
+                    error = "Datos rellenados desde un enlace. Comprueba que el servidor es el tuyo: \(host)"
+                }
+            }
             user = p.user
             pass = p.pass
         }

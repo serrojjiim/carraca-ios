@@ -178,6 +178,19 @@ final class Downloads: NSObject, ObservableObject {
         }
     }
 
+    /// Cerrar sesión: fuera todas las descargas (lo bajado con una cuenta no debe verse desde otra).
+    func removeAll() {
+        current?.cancel()
+        current = nil
+        for it in items {
+            try? FileManager.default.removeItem(at: fileURL(it))
+            try? FileManager.default.removeItem(at: Self.resumeFile(it.id))
+        }
+        items.removeAll()
+        speed = [:]
+        save(force: true)
+    }
+
     /// Ajustes > Descargas: borrar solas las descargas ya vistas (al terminar de verlas).
     func removeWatched(_ isWatched: (DownloadItem) -> Bool) {
         guard DownloadPrefs.autoDelete else { return }
