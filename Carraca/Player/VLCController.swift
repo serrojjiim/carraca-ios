@@ -20,6 +20,30 @@ final class PlayerPresence: ObservableObject {
     @Published var open = false
 }
 
+/// Cómo ha terminado una sesión de reproducción (telemetría).
+fileprivate enum PlayOutcome { case ok, stop, err }
+
+/// Datos de una sesión de reproducción para el resumen anónimo `play` (ver tools/telemetria/SCHEMA.md).
+fileprivate struct PlayTelemetry {
+    let kind: String
+    let sid: Int?
+    let startedAt = Date()
+    var firstFrameAt: Date?
+    var stalls = 0
+    var stallMs = 0
+    var stallStart: Date?
+    var wd = 0
+    var retries = 0
+    var failed = false
+    var err = "checking"
+    var http = 0
+
+    init(kind: String, sid: Int?) {
+        self.kind = kind
+        self.sid = sid
+    }
+}
+
 /// Envoltorio del motor VLC (reproduce TS, MKV, AVI…).
 final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let player = VLCMediaPlayer()
@@ -85,6 +109,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var lastSeenTime = -1
     private var lastStallRestart = Date.distantPast
     private var stallRestarts = 0
+    /// Sesión de telemetría en curso (nil para vista previa, archivos locales y tras cerrar).
+    private var tele: PlayTelemetry?
 
     override init() {
         super.init()
@@ -97,6 +123,11 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if url != self.url {
             lastStallRestart = .distantPast
             stallRestarts = 0
+        }
+        // telemetría: una sesión por canal/película (los reintentos del mismo canal no abren otra)
+        if !muted, !url.isFileURL, tele == nil || url != self.url {
+            telemetryFinish(.ok)
+            telemetryBegin(url: url, live: live)
         }
         self.url = url
         self.live = live
@@ -139,7 +170,9 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if retries > 0, Date().timeIntervalSince(lastRetryAt) > 30, Date().timeIntervalSince(lastProgress) < 6 { retries = 0 }
         let stalled = Date().timeIntervalSince(lastProgress)
         guard stalled > (live ? 15 : 25), Date().timeIntervalSince(lastStallRestart) > 60 else { return }
+        tele?.wd += 1
         if stallRestarts >= 3 {
+            telemetryMarkFailed()
             failed = true
             buffering = false
             playing = false
@@ -214,6 +247,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func stop() {
+        telemetryFinish(.stop)
         halted = true      // ningún reintento pendiente puede reabrir el canal después de cerrar
         watchdog?.invalidate()
         watchdog = nil
@@ -232,6 +266,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     /// Para la reproducción pero deja el controlador listo para otro start() (vista previa).
     func halt() {
+        telemetryFinish(.stop)
         watchdog?.invalidate()
         watchdog = nil
         halted = true
@@ -319,9 +354,11 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             case .opening:
                 self.buffering = true
             case .buffering:
-                if !self.player.isPlaying { self.buffering = true }
+                if !self.player.isPlaying { self.buffering = true; self.telemetryStallBegin() }
             case .playing:
                 self.buffering = false
+                self.telemetryStallEnd()
+                self.telemetryFirstFrame()
                 self.playing = true
                 // (los reintentos NO se ponen a 0 aquí: un canal que arranca y se cae otra vez reintentaría sin tope)
                 if !self.prefsApplied, !self.muted {
@@ -338,7 +375,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             case .error:
                 self.handleError()
             case .ended:
-                if self.live { self.handleError() } else { self.ended = true }
+                if self.live { self.handleError() } else { self.ended = true; self.telemetryFinish(.ok) }
             case .stopped:
                 self.playing = false
             default:
@@ -358,6 +395,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 if self.lastSeenTime >= 0 { self.stallRestarts = 0 }
                 self.lastSeenTime = t
                 self.lastProgress = Date()
+                self.telemetryStallEnd()
+                self.telemetryFirstFrame()
             }
             if let target = self.seekTarget {
                 // Hasta que VLC llega al destino, sus tiempos son del sitio viejo: no los enseñamos.
@@ -386,6 +425,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             return
         }
         guard retries < 3, let url else {
+            telemetryMarkFailed()
             failed = true
             buffering = false
             playing = false
@@ -404,22 +444,26 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 guard let self else { return }
                 self.probing = false
                 guard !self.halted, self.url == url else { return }
-                let reason = await VLCController.probe(url)
+                let probed = await VLCController.probe(url)
                 guard !self.halted, self.url == url else { return }
+                let reason = probed.reason
                 if reason == .blocked || reason == .busy || reason == .missing {
                     self.failReason = reason
                     self.failed = true
                     self.buffering = false
                     self.playing = false
+                    self.telemetryFailed(reason, http: probed.http)
                     return
                 }
                 self.retries = 1
+                self.tele?.retries += 1
                 self.lastRetryAt = Date()
                 self.start(url: url, startMs: resumeAt, live: isLive, muted: false)
             }
             return
         }
         retries += 1
+        tele?.retries += 1
         lastRetryAt = Date()
         buffering = true
         let isMuted = muted
@@ -433,24 +477,26 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 extension VLCController {
     /// Una sola petición (solo cabeceras, se corta en cuanto responde) para saber qué ha pasado:
     /// cuenta en uso en otro sitio, IP bloqueada, contenido retirado, servidor caído o sin internet.
-    static func probe(_ url: URL) async -> FailReason {
+    /// Devuelve el motivo y, si lo hay, el código HTTP (para la telemetría; nunca el texto del error).
+    static func probe(_ url: URL) async -> (reason: FailReason, http: Int) {
         var req = URLRequest(url: url, timeoutInterval: 8)
         req.setValue("bytes=0-0", forHTTPHeaderField: "Range")
         req.setValue("CarracaiOS/\(AppConfig.version)", forHTTPHeaderField: "User-Agent")
         do {
             let (bytes, resp) = try await URLSession.shared.bytes(for: req)
             bytes.task.cancel()
-            switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
-            case 401, 403, 407, 423, 451: return .blocked
-            case 429, 456...462, 509: return .busy
-            case 404, 410, 551: return .missing
-            case 500...599: return .server
-            default: return .generic
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            switch code {
+            case 401, 403, 407, 423, 451: return (.blocked, code)
+            case 429, 456...462, 509: return (.busy, code)
+            case 404, 410, 551: return (.missing, code)
+            case 500...599: return (.server, code)
+            default: return (.generic, code)
             }
         } catch let e as URLError where [URLError.Code.notConnectedToInternet, .networkConnectionLost, .dataNotAllowed].contains(e.code) {
-            return .offline
+            return (.offline, 0)
         } catch {
-            return .generic
+            return (.generic, 0)
         }
     }
 
@@ -462,7 +508,90 @@ extension VLCController {
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard let self, !self.halted else { return }
-            self.failReason = await VLCController.probe(url)
+            let probed = await VLCController.probe(url)
+            self.failReason = probed.reason
+            self.telemetryFailed(probed.reason, http: probed.http)
+        }
+    }
+
+    // MARK: Telemetría anónima (un resumen `play` por sesión; sin URLs ni nombres)
+
+    /// Abre la sesión: el tipo sale de la ruta de Xtream y el id es solo el número del stream.
+    private func telemetryBegin(url: URL, live: Bool) {
+        let kind = live ? "live" : (url.path.contains("/series/") ? "series" : "vod")
+        let sid = Int(url.deletingPathExtension().lastPathComponent)
+        tele = PlayTelemetry(kind: kind, sid: sid)
+        Telemetry.shared.setPlaybackActive(true)
+    }
+
+    /// Cierra la sesión. Menos de 5 s sin fallo cuenta como zapping; el resto emite `play`.
+    private func telemetryFinish(_ outcome: PlayOutcome) {
+        guard var t = tele else { return }
+        tele = nil
+        Telemetry.shared.setPlaybackActive(false)
+        let now = Date()
+        if let s = t.stallStart {
+            t.stallStart = nil
+            let ms = Int(now.timeIntervalSince(s) * 1000)
+            if ms >= 1000 { t.stalls += 1; t.stallMs += ms }
+        }
+        let out: PlayOutcome = t.failed ? .err : outcome
+        if out != .err && now.timeIntervalSince(t.startedAt) < 5 {
+            Telemetry.shared.countZap()
+            return
+        }
+        let ttff = t.firstFrameAt.map { Int($0.timeIntervalSince(t.startedAt) * 1000) } ?? -1
+        let watch = t.firstFrameAt.map { Int(now.timeIntervalSince($0)) } ?? 0
+        let outName = out == .ok ? "ok" : (out == .stop ? "stop" : "err")
+        var f: [String: TVal] = [
+            "kind": .s(t.kind), "eng": .s("vlc"), "fb": .i(0), "ttff": .i(ttff),
+            "stalls": .i(t.stalls), "stall_ms": .i(t.stallMs), "wd": .i(t.wd), "retries": .i(t.retries),
+            "out": .s(outName), "err": .s(out == .err ? t.err : "none"),
+            "http": .i(t.http), "watch_s": .i(watch)
+        ]
+        if let sid = t.sid { f["sid"] = .i(sid) }
+        Telemetry.shared.log("play", f)
+    }
+
+    private func telemetryFirstFrame() {
+        if tele?.firstFrameAt == nil { tele?.firstFrameAt = Date() }
+    }
+
+    /// Un corte cuenta desde que VLC para tras el primer fotograma (no el arranque ni un salto de posición).
+    private func telemetryStallBegin() {
+        guard tele?.firstFrameAt != nil, tele?.stallStart == nil, seekTarget == nil else { return }
+        tele?.stallStart = Date()
+    }
+
+    private func telemetryStallEnd() {
+        guard let s = tele?.stallStart else { return }
+        tele?.stallStart = nil
+        let ms = Int(Date().timeIntervalSince(s) * 1000)
+        if ms >= 1000 { tele?.stalls += 1; tele?.stallMs += ms }
+    }
+
+    /// Se marca el fallo; el motivo llega cuando el diagnóstico contesta (o al cerrar la sesión).
+    private func telemetryMarkFailed() {
+        tele?.failed = true
+    }
+
+    private func telemetryFailed(_ reason: FailReason, http: Int) {
+        guard tele != nil else { return }
+        tele?.failed = true
+        tele?.err = VLCController.telemetryErr(reason)
+        tele?.http = http
+        telemetryFinish(.err)
+    }
+
+    private static func telemetryErr(_ r: FailReason) -> String {
+        switch r {
+        case .checking: return "checking"
+        case .generic, .file: return "generic"
+        case .busy: return "busy"
+        case .blocked: return "blocked"
+        case .missing: return "missing"
+        case .server: return "server"
+        case .offline: return "offline"
         }
     }
 }
