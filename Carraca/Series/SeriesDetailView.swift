@@ -79,8 +79,14 @@ struct SeriesDetailView: View {
                         Text("Temporada \(season)")
                     }
                 }
+            } else if info != nil {
+                Text("Esta serie no tiene capítulos disponibles.").foregroundStyle(.secondary)
             } else if let error {
-                Text(error).foregroundStyle(.secondary)
+                VStack(spacing: 10) {
+                    Text(error).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    Button("Reintentar") { Task { await load() } }.buttonStyle(.bordered)
+                }
+                .frame(maxWidth: .infinity)
             } else {
                 HStack { Spacer(); ProgressView(); Spacer() }
             }
@@ -154,7 +160,12 @@ struct SeriesDetailView: View {
 
     @MainActor
     private func load() async {
-        guard info == nil, let api = session.api else { return }
+        guard info == nil else { return }
+        guard let api = session.api else {
+            error = "No hay conexión con el servidor. Revisa la cuenta o la conexión."
+            return
+        }
+        error = nil
         do {
             let i = try await api.seriesInfo(series.id)
             info = i

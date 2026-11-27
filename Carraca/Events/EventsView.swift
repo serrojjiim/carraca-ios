@@ -73,12 +73,14 @@ struct EventsView: View {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if events.filter({ now < $0.end }).isEmpty {
             VStack(spacing: 12) {
-                Image(systemName: "sportscourt").font(.system(size: 44)).foregroundStyle(.secondary)
-                Text(events.isEmpty ? "No se ha podido cargar la lista" : "No quedan eventos por hoy")
+                Image(systemName: offline ? "wifi.slash" : "sportscourt").font(.system(size: 44)).foregroundStyle(.secondary)
+                Text(emptyTitle)
                     .font(.headline)
-                Text("La lista se actualiza por la mañana y a media tarde.")
+                Text(emptySubtitle)
                     .font(.subheadline).foregroundStyle(.secondary)
-                Button("Actualizar") { Task { await reload() } }.buttonStyle(.bordered)
+                    .multilineTextAlignment(.center)
+                Button(events.isEmpty ? "Reintentar" : "Actualizar") { Task { await reload() } }
+                    .buttonStyle(.borderedProminent)
             }
             .padding()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -108,6 +110,17 @@ struct EventsView: View {
             .listStyle(.insetGrouped)
             .refreshable { await reload() }
         }
+    }
+
+    /// Textos de la pantalla vacía: sin conexión y fallo de carga se distinguen y se puede reintentar.
+    private var emptyTitle: String {
+        if events.isEmpty { return offline ? "Sin conexión" : "No se ha podido cargar la lista" }
+        return "No quedan eventos por hoy"
+    }
+
+    private var emptySubtitle: String {
+        if events.isEmpty { return offline ? "Revisa la conexión y pulsa Reintentar." : "Pulsa Reintentar para volver a cargarla." }
+        return "La lista se actualiza por la mañana y a media tarde."
     }
 
     /// Filtro por deporte (solo los que hay hoy).
