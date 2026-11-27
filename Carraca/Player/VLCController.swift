@@ -37,6 +37,17 @@ fileprivate struct PlayTelemetry {
     var failed = false
     var err = "checking"
     var http = 0
+    // Ampliación v2 (diagnóstico): solo se rellenan si VLC/el sistema lo dan; si no, se omiten en el envío.
+    var cont: String?
+    var vc: String?
+    var w: Int?
+    var h: Int?
+    var fps: Int?
+    var vbr: Int?
+    var memMin: Int?
+    var frzStart: Date?     // inicio de un episodio de congelación abierto
+    var frzMs = 0
+    var frzN = 0
 
     init(kind: String, sid: Int?) {
         self.kind = kind
@@ -120,6 +131,8 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func start(url: URL, startMs: Int, live: Bool, muted: Bool = false) {
         // con AirPlay (relay) el servidor tiene la única conexión: aquí no se abre nada
         guard !suspended else { return }
+        // un episodio de congelación abierto termina aquí (reinicio del vigilante o del motor)
+        telemetryFreezeEnd()
         if url != self.url {
             lastStallRestart = .distantPast
             stallRestarts = 0
@@ -165,6 +178,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     private func checkStall() {
         guard !halted, !failed, !ended, let url else { return }
+        telemetryWatch()
         if player.state == .paused { lastProgress = Date(); return }
         // reproduciendo con normalidad desde hace un rato: los reintentos vuelven a empezar
         if retries > 0, Date().timeIntervalSince(lastRetryAt) > 30, Date().timeIntervalSince(lastProgress) < 6 { retries = 0 }
@@ -396,6 +410,7 @@ final class VLCController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.lastSeenTime = t
                 self.lastProgress = Date()
                 self.telemetryStallEnd()
+                self.telemetryFreezeEnd()
                 self.telemetryFirstFrame()
             }
             if let target = self.seekTarget {
@@ -521,11 +536,28 @@ extension VLCController {
         let kind = live ? "live" : (url.path.contains("/series/") ? "series" : "vod")
         let sid = Int(url.deletingPathExtension().lastPathComponent)
         tele = PlayTelemetry(kind: kind, sid: sid)
+        tele?.cont = VLCController.containerKind(url)
         Telemetry.shared.setPlaybackActive(true)
+    }
+
+    /// Contenedor/protocolo deducido de la extensión de la URL (la URL en sí nunca se envía).
+    /// Sin extensión (típico en directo Xtream) no se sabe: nil.
+    private static func containerKind(_ url: URL) -> String? {
+        let ext = url.pathExtension.lowercased()
+        if ext.isEmpty { return nil }
+        switch ext {
+        case "ts": return "ts"
+        case "m3u8": return "hls"
+        case "mkv": return "mkv"
+        case "mp4", "m4v": return "mp4"
+        case "mpd": return "dash"
+        default: return "other"
+        }
     }
 
     /// Cierra la sesión. Menos de 5 s sin fallo cuenta como zapping; el resto emite `play`.
     private func telemetryFinish(_ outcome: PlayOutcome) {
+        telemetryFreezeEnd()
         guard var t = tele else { return }
         tele = nil
         Telemetry.shared.setPlaybackActive(false)
@@ -550,11 +582,93 @@ extension VLCController {
             "http": .i(t.http), "watch_s": .i(watch)
         ]
         if let sid = t.sid { f["sid"] = .i(sid) }
+        // ampliación v2: solo los campos que se han llegado a conocer
+        if let c = t.cont { f["cont"] = .s(c) }
+        if let v = t.vc, let s = Telemetry.safeText(v) { f["vc"] = .s(s) }
+        if let w = t.w, let h = t.h { f["w"] = .i(w); f["h"] = .i(h) }
+        if let fps = t.fps { f["fps"] = .i(fps) }
+        if let vbr = t.vbr { f["vbr"] = .i(vbr) }
+        if let net = Telemetry.netType { f["net"] = .s(net) }
+        if let mem = t.memMin { f["mem_mb"] = .i(mem) }
+        f["frz_ms"] = .i(t.frzMs)
+        f["frz_n"] = .i(t.frzN)
         Telemetry.shared.log("play", f)
     }
 
     private func telemetryFirstFrame() {
         if tele?.firstFrameAt == nil { tele?.firstFrameAt = Date() }
+    }
+
+    /// Tick del vigilante (cada 3 s con reproducción): memoria mínima, datos del vídeo y congelaciones.
+    /// Solo observa; no cambia la reproducción ni el vigilante.
+    private func telemetryWatch() {
+        guard tele != nil else { return }
+        if let mb = Telemetry.availableMemoryMB() {
+            tele?.memMin = min(tele?.memMin ?? mb, mb)
+        }
+        telemetryReadTracks()
+        // congelación: la posición lleva ≥ 3 s parada estando "reproduciendo" y sin buffering
+        let stalledFor = Date().timeIntervalSince(lastProgress)
+        let frozen = tele?.firstFrameAt != nil && player.isPlaying && !buffering && seekTarget == nil && stalledFor >= 3
+        if frozen {
+            if tele?.frzStart == nil { tele?.frzStart = lastProgress }
+        } else {
+            tele?.frzStart = nil    // no era congelación (pausa, buffering o salto): se descarta
+        }
+    }
+
+    /// Cierra un episodio de congelación abierto. Cuenta solo si ha durado al menos 3 s.
+    private func telemetryFreezeEnd() {
+        guard let s = tele?.frzStart else { return }
+        tele?.frzStart = nil
+        let ms = Int(Date().timeIntervalSince(s) * 1000)
+        if ms >= 3000 {
+            tele?.frzN += 1
+            tele?.frzMs += ms
+        }
+    }
+
+    /// Códec, resolución, fps y tasa de vídeo, leídos de VLC cuando ya hay imagen (se reintenta en cada tick hasta tenerlos).
+    private func telemetryReadTracks() {
+        guard let t = tele, t.firstFrameAt != nil, t.w == nil, let media = player.media else { return }
+        let infos = (media.tracksInformation as? [[String: Any]]) ?? []
+        guard let v = infos.first(where: { $0[VLCMediaTracksInformationVideoWidth] != nil }) else { return }
+        let w = (v[VLCMediaTracksInformationVideoWidth] as? NSNumber)?.intValue ?? 0
+        let h = (v[VLCMediaTracksInformationVideoHeight] as? NSNumber)?.intValue ?? 0
+        guard (1...8192).contains(w), (1...8192).contains(h) else { return }
+        tele?.w = w
+        tele?.h = h
+        if let n = v[VLCMediaTracksInformationCodec] as? NSNumber {
+            tele?.vc = VLCController.codecName(fourCC: n.uint32Value)
+        }
+        let num = (v[VLCMediaTracksInformationFrameRateNum] as? NSNumber)?.doubleValue ?? 0
+        let den = (v[VLCMediaTracksInformationFrameRateDen] as? NSNumber)?.doubleValue ?? 0
+        if num > 0, den > 0 {
+            let fps = Int((num / den).rounded())
+            if (1...240).contains(fps) { tele?.fps = fps }
+        }
+        let kbps = ((v[VLCMediaTracksInformationBitrate] as? NSNumber)?.intValue ?? 0) / 1000
+        if (1...400_000).contains(kbps) { tele?.vbr = kbps }
+    }
+
+    /// FourCC de VLC a nombre corto ("h264", "hevc"…). Prueba ambos órdenes de bytes; nil si no es conocido.
+    private static func codecName(fourCC v: UInt32) -> String? {
+        let known: [(code: String, name: String)] = [
+            ("avc1", "h264"), ("avc3", "h264"), ("h264", "h264"),
+            ("hvc1", "hevc"), ("hev1", "hevc"), ("hevc", "hevc"),
+            ("mp2v", "mpeg2"), ("mpg2", "mpeg2"), ("mp4v", "mpeg4"),
+            ("vp80", "vp8"), ("vp90", "vp9"), ("av01", "av1")
+        ]
+        return known.first(where: { v == fourCCValue($0.code, bigEndian: false) || v == fourCCValue($0.code, bigEndian: true) })?.name
+    }
+
+    private static func fourCCValue(_ s: String, bigEndian: Bool) -> UInt32 {
+        var out: UInt32 = 0
+        for (i, b) in s.utf8.prefix(4).enumerated() {
+            let shift = bigEndian ? 8 * (3 - i) : 8 * i
+            out |= UInt32(b) << UInt32(shift)
+        }
+        return out
     }
 
     /// Un corte cuenta desde que VLC para tras el primer fotograma (no el arranque ni un salto de posición).
