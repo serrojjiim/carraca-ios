@@ -641,8 +641,8 @@ extension VLCController {
         if let n = v[VLCMediaTracksInformationCodec] as? NSNumber {
             tele?.vc = VLCController.codecName(fourCC: n.uint32Value)
         }
-        let num = (v[VLCMediaTracksInformationFrameRateNum] as? NSNumber)?.doubleValue ?? 0
-        let den = (v[VLCMediaTracksInformationFrameRateDen] as? NSNumber)?.doubleValue ?? 0
+        let num = (v[VLCMediaTracksInformationFrameRate] as? NSNumber)?.doubleValue ?? 0
+        let den = (v[VLCMediaTracksInformationFrameRateDenominator] as? NSNumber)?.doubleValue ?? 0
         if num > 0, den > 0 {
             let fps = Int((num / den).rounded())
             if (1...240).contains(fps) { tele?.fps = fps }
