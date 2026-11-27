@@ -604,7 +604,8 @@ extension VLCController {
     private func telemetryWatch() {
         guard tele != nil else { return }
         if let mb = Telemetry.availableMemoryMB() {
-            tele?.memMin = min(tele?.memMin ?? mb, mb)
+            let curMem = tele?.memMin ?? mb
+            tele?.memMin = min(curMem, mb)
         }
         telemetryReadTracks()
         // congelación: la posición lleva ≥ 3 s parada estando "reproduciendo" y sin buffering
