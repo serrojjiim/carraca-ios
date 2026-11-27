@@ -51,7 +51,11 @@ final class Telemetry: @unchecked Sendable {
     private var inFlight = false
     private var lastSendAt = Date.distantPast
     private var zapCount = 0
-    private var startLogged = false
+    // Evento `start` (una vez por proceso): cold_ms al arrancar; list_ms, n y cache con la primera carga de directo.
+    private var startArmed = false              // logStart ya ha corrido
+    private var startCold: Int?
+    private var startList: [String: TVal]?
+    private var startDone = false
 
     // Protegido por `lock` (lo leen y escriben hilos distintos):
     private var playbackOn = false
@@ -72,21 +76,40 @@ final class Telemetry: @unchecked Sendable {
         q.async { self.loadBuffer() }
     }
 
-    /// Primera pantalla útil: un evento `start` por proceso, con el tiempo desde que se lanzó.
+    /// Primera pantalla útil: guarda cold_ms. El evento `start` sale cuando llega la lista de directo
+    /// (noteList) o, si no llega, al pasar a segundo plano (flush) solo con cold_ms.
     func logStart() {
         let cold = Self.coldStartMs()
         q.async { [weak self] in
-            guard let self, !self.startLogged else { return }
-            self.startLogged = true
-            var f: [String: TVal] = [:]
-            if let cold { f["cold_ms"] = .i(cold) }
-            self.enqueue("start", f)
+            guard let self, !self.startDone else { return }
+            self.startCold = cold
+            self.startArmed = true
+            self.emitStartIfReady(atBackground: false)
         }
     }
 
-    /// Intento de envío al pasar a segundo plano.
+    /// Primera carga NO silenciosa de la lista de directo de esta sesión de proceso (LiveView).
+    /// `cache`: "hit" (copia guardada), "miss" (bajada del servidor) o "none".
+    func noteList(ms: Int, n: Int, cache: String) {
+        guard Self.isEnabled else { return }
+        let cacheValue = ["hit", "miss", "none"].contains(cache) ? cache : "none"
+        q.async { [weak self] in
+            guard let self, !self.startDone, self.startList == nil else { return }
+            self.startList = [
+                "list_ms": .i(min(max(ms, 0), 600_000)),
+                "n": .i(min(max(n, 0), 10_000_000)),
+                "cache": .s(cacheValue)
+            ]
+            self.emitStartIfReady(atBackground: false)
+        }
+    }
+
+    /// Intento de envío al pasar a segundo plano. Si la lista de directo aún no llegó, el `start` sale solo con cold_ms.
     func flush() {
-        q.async { self.trySend() }
+        q.async {
+            self.emitStartIfReady(atBackground: true)
+            self.trySend()
+        }
     }
 
     /// Intento de envío al arrancar, con un retardo para no pesar en el arranque.
@@ -132,6 +155,15 @@ final class Telemetry: @unchecked Sendable {
     }
 
     // MARK: Trabajo en la cola `q`
+
+    /// Emite el `start` una sola vez por proceso. Sin lista, solo si es al pasar a segundo plano. Solo en `q`.
+    private func emitStartIfReady(atBackground: Bool) {
+        guard !startDone, startArmed, atBackground || startList != nil else { return }
+        startDone = true
+        var f: [String: TVal] = startList ?? [:]
+        if let c = startCold { f["cold_ms"] = .i(c) }
+        enqueue("start", f)
+    }
 
     private func enqueue(_ event: String, _ fields: [String: TVal]) {
         guard Self.isEnabled else { return }
