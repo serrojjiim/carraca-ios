@@ -27,6 +27,8 @@ struct PlayerView: View {
     /// Canales vistos hace poco (arriba en la lista de canales), calculados al abrirla.
     @State private var recentStreams: [LiveStream] = []
     @State private var zapWork: DispatchWorkItem?
+    /// Pausado porque entró una llamada o Siri: solo se reanuda si fue esta interrupción la que paró.
+    @State private var pausedByInterruption = false
     /// Siguiente capítulo: cuenta atrás al acabar.
     @State private var upNext: PlayItem?
     @State private var countdown = 10
@@ -207,6 +209,10 @@ struct PlayerView: View {
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { _ in
             routeChanged()
         }
+        // llamada, Siri, alarma: se pausa al empezar y, si iOS lo permite, se reanuda al terminar
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { n in
+            interruptionChanged(n)
+        }
         // con pantalla externa (espejo) manda el espejo: la emisión por relay se para
         .onChange(of: external.active) { on in
             if on, cast.phase != .idle { leaveCast() }
@@ -228,6 +234,28 @@ struct PlayerView: View {
             if dragMode != .volume { showHUD(volumeIcon(Double(v)), Double(v)) }
         }
         .task { await loadEPG() }
+    }
+
+    /// Interrupción de audio. Al empezar se pausa (si estaba reproduciendo). Al terminar, si iOS dice
+    /// que se puede seguir, se reanuda con la MISMA conexión (play, nunca start): no se abre nada nuevo.
+    /// En directo, si el stream ya murió lo cubre el vigilante de VLCController (con sus límites).
+    private func interruptionChanged(_ n: Notification) {
+        guard cast.phase == .idle,
+              let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        switch type {
+        case .began:
+            guard vlc.playing else { return }
+            pausedByInterruption = true
+            vlc.pause()
+        case .ended:
+            guard pausedByInterruption else { return }
+            pausedByInterruption = false
+            let opts = AVAudioSession.InterruptionOptions(rawValue: n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+            if opts.contains(.shouldResume) { vlc.play() }
+        @unknown default:
+            break
+        }
     }
 
     // MARK: Controles
@@ -770,6 +798,7 @@ struct PlayerView: View {
     /// Cambia al canal `next` de la lista (desde el panel, casi sin espera).
     private func zapTo(_ next: Int, delay: Double) {
         guard item.isLive, let urlFor = item.channelURL, item.channels.indices.contains(next) else { return }
+        Haptics.light()
         channelIndex = next
         epg = []
         showControls = true

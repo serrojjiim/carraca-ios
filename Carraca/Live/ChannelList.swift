@@ -218,13 +218,19 @@ private struct FavoriteActions: ViewModifier {
         let fav = session.isFavorite(stream)
         content
             .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                Button { session.toggleFavorite(stream) } label: {
+                Button {
+                    Haptics.light()
+                    session.toggleFavorite(stream)
+                } label: {
                     Label(fav ? "Quitar" : "Favorito", systemImage: fav ? "star.slash" : "star.fill")
                 }
                 .tint(.yellow)
             }
             .contextMenu {
-                Button { session.toggleFavorite(stream) } label: {
+                Button {
+                    Haptics.light()
+                    session.toggleFavorite(stream)
+                } label: {
                     Label(fav ? "Quitar de favoritos" : "Añadir a favoritos", systemImage: fav ? "star.slash" : "star")
                 }
             }
