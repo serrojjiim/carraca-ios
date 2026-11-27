@@ -17,6 +17,11 @@ struct LoginView: View {
     @State private var m3u = ""
     @State private var busy = false
     @State private var error: String?
+    /// Campo con el foco: Intro / Siguiente pasa al siguiente campo.
+    private enum FieldID: Hashable { case server, user, pass, m3u }
+    @FocusState private var focus: FieldID?
+    /// Botón del ojo: ver la contraseña mientras se escribe.
+    @State private var showPass = false
 
     var body: some View {
         ScrollView {
@@ -34,24 +39,44 @@ struct LoginView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     if mode == .xtream {
                         field(Flavor.isPrivate ? "Servidor (opcional)" : "Servidor, ej. http://servidor.com:8080",
-                              text: $server, icon: "server.rack", keyboard: .URL)
+                              text: $server, icon: "server.rack", keyboard: .URL, focus: .server, next: .user)
                         if Flavor.isPrivate {
                             Text("Déjalo vacío para usar el servidor Carraca.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                                 .padding(.leading, 4)
                         }
-                        field("Usuario", text: $user, icon: "person", keyboard: .asciiCapable)
+                        field("Usuario", text: $user, icon: "person", keyboard: .asciiCapable, focus: .user, next: .pass)
                         HStack {
                             Image(systemName: "lock").foregroundStyle(.secondary).frame(width: 22)
-                            SecureField("Contraseña", text: $pass)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
+                            if showPass {
+                                TextField("Contraseña", text: $pass)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .focused($focus, equals: .pass)
+                                    .submitLabel(.go)
+                                    .onSubmit { submitFromPassword() }
+                            } else {
+                                SecureField("Contraseña", text: $pass)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .focused($focus, equals: .pass)
+                                    .submitLabel(.go)
+                                    .onSubmit { submitFromPassword() }
+                            }
+                            Button { showPass.toggle() } label: {
+                                Image(systemName: showPass ? "eye.slash" : "eye")
+                                    .foregroundStyle(.secondary)
+                                    .hitTarget()
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel(showPass ? "Ocultar contraseña" : "Mostrar contraseña")
                         }
                         .padding(14)
                         .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
                     } else {
-                        field("URL de la lista (http://…/lista.m3u)", text: $m3u, icon: "list.bullet.rectangle", keyboard: .URL)
+                        field("URL de la lista (http://…/lista.m3u)", text: $m3u, icon: "list.bullet.rectangle",
+                              keyboard: .URL, focus: .m3u, next: nil)
                     }
                 }
 
@@ -120,16 +145,33 @@ struct LoginView: View {
         session.prefill = nil
     }
 
-    private func field(_ title: String, text: Binding<String>, icon: String, keyboard: UIKeyboardType) -> some View {
+    private func field(_ title: String, text: Binding<String>, icon: String, keyboard: UIKeyboardType,
+                       focus target: FieldID, next: FieldID?) -> some View {
         HStack {
             Image(systemName: icon).foregroundStyle(.secondary).frame(width: 22)
             TextField(title, text: text)
                 .keyboardType(keyboard)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .focused($focus, equals: target)
+                .submitLabel(next == nil ? .go : .next)
+                .onSubmit {
+                    if let n = next {
+                        focus = n
+                    } else {
+                        focus = nil
+                        if canSubmit { Task { await doLogin() } }
+                    }
+                }
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
+    }
+
+    /// Intro en la contraseña: se quita el teclado y entra directamente (si ya están todos los datos).
+    private func submitFromPassword() {
+        focus = nil
+        if canSubmit { Task { await doLogin() } }
     }
 
     private func doLogin() async {
